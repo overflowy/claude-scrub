@@ -9,13 +9,27 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"syscall"
 	"time"
 
 	flag "github.com/spf13/pflag"
 )
 
-var version = "dev"
+// Set by release builds with -ldflags "-X main.version=..."
+var version = ""
+
+// buildVersion is the release version, else the module version go install
+// recorded (v1.0.1, or a pseudo-version for a commit), else "dev".
+func buildVersion() string {
+	if version != "" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return "dev"
+}
 
 const usageHead = `Redact secrets from Claude Code history.
 
@@ -81,7 +95,7 @@ func run() int {
 		return 2
 	}
 	if opts.version {
-		fmt.Println("claude-scrub", version)
+		fmt.Println("claude-scrub", buildVersion())
 		return 0
 	}
 
