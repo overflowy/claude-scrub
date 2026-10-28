@@ -1,0 +1,68 @@
+# https://taskfile.dev
+
+version: '3'
+
+vars:
+  BIN: claude-scrub
+  INSTALL_DIR: '{{.HOME}}/.local/bin'
+
+tasks:
+  default:
+    cmds:
+      - task --list
+    silent: true
+
+  build:
+    desc: Build ./{{.BIN}}
+    cmds:
+      - go build -o {{.BIN}} .
+    sources:
+      - '**/*.go'
+      - go.mod
+      - go.sum
+    generates:
+      - '{{.BIN}}'
+
+  install:
+    desc: Build and install to {{.INSTALL_DIR}}
+    cmds:
+      - mkdir -p {{.INSTALL_DIR}}
+      - go build -o {{.INSTALL_DIR}}/{{.BIN}} .
+
+  test:
+    desc: Run the tests
+    cmds:
+      - go test -count=1 ./...
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  fix:
+    desc: Apply go fix modernizations
+    cmds:
+      - go fix ./...
+
+  fmt:
+    desc: Format the code
+    cmds:
+      - gofmt -w .
+
+  check:
+    desc: Check formatting, go fix, vet and tests without changing anything
+    cmds:
+      - test -z "$(gofmt -l .)" || (gofmt -l . && echo "Run 'task fmt'" && exit 1)
+      - test -z "$(go fix -diff ./...)" || (echo "Run 'task fix'" && exit 1)
+      - task: vet
+      - task: test
+
+  dry-run:
+    desc: 'Report what would be redacted (extra flags after --, e.g. task dry-run -- -v)'
+    cmds:
+      - go run . --dry-run {{.CLI_ARGS}}
+
+  clean:
+    desc: Remove the built binary
+    cmds:
+      - rm -f {{.BIN}}
