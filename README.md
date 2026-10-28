@@ -18,9 +18,42 @@ already been sent, and this tool can't change that.
 
 ## Install
 
+### Prebuilt binary
+
+Download the file for your platform from the
+[releases page](https://github.com/overflowy/claude-scrub/releases/latest),
+make it executable, and put it on your `PATH`. With the GitHub CLI, on an
+Apple Silicon Mac:
+
+```sh
+gh release download -R overflowy/claude-scrub -p '*darwin_arm64'
+chmod +x claude-scrub_*_darwin_arm64
+mv claude-scrub_*_darwin_arm64 ~/.local/bin/claude-scrub
+```
+
+The other builds are `darwin_amd64`, `linux_amd64`, `linux_arm64`,
+`windows_amd64.exe` and `windows_arm64.exe`. `checksums.txt` has their
+SHA-256 sums. The macOS binaries aren't signed, so if macOS refuses to run
+one, clear the quarantine flag with
+`xattr -d com.apple.quarantine ~/.local/bin/claude-scrub`.
+
+### With Go
+
+Needs Go 1.26 or newer.
+
+```sh
+go install github.com/overflowy/claude-scrub@latest
+```
+
+This puts the binary in `$(go env GOPATH)/bin`, usually `~/go/bin`.
+
+### From source
+
 Needs Go 1.26 or newer and [Task](https://taskfile.dev).
 
 ```sh
+git clone https://github.com/overflowy/claude-scrub
+cd claude-scrub
 task install   # builds ~/.local/bin/claude-scrub
 ```
 
@@ -59,7 +92,7 @@ are scanned whatever their age.
 ### After every session
 
 Add a SessionEnd hook to `~/.claude/settings.json` and each session gets
-scrubbed when it ends:
+scrubbed when it ends. Use the path you installed the binary to:
 
 ```json
 {
