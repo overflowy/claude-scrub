@@ -1,5 +1,7 @@
 # claude-scrub
 
+<img width="790" height="602" alt="demo" src="https://github.com/user-attachments/assets/23841ac2-dc29-4714-b7d2-4da3c275fede" />
+
 Claude Code keeps everything you and the model saw in plain text under
 `~/.claude`. That includes every `cat .env`, every config file it read and
 every token you pasted into a prompt. claude-scrub finds the secrets in that
@@ -12,9 +14,6 @@ DB_PASSWORD=[REDACTED:db_password]
 It covers session transcripts (subagents and tool results included), prompt
 history, the paste cache, file history and shell snapshots. It leaves
 settings, plugins and live session state alone.
-
-It cleans up after the fact. Anything the model saw during a session has
-already been sent, and this tool can't change that.
 
 ## Install
 
