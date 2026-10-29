@@ -2,6 +2,8 @@
 
 <img width="790" height="602" alt="demo" src="https://github.com/user-attachments/assets/23841ac2-dc29-4714-b7d2-4da3c275fede" />
 
+---
+
 Claude Code keeps everything you and the model saw in plain text under
 `~/.claude`. That includes every `cat .env`, every config file it read and
 every token you pasted into a prompt. claude-scrub finds the secrets in that
