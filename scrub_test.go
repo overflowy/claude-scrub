@@ -315,6 +315,9 @@ func TestHookPaths(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "projects", "p", "abc", "subagents"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(transcript, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	in := strings.NewReader(`{"session_id":"abc","transcript_path":"` + transcript + `"}`)
 	got, err := hookPaths(in, root)
 	if err != nil {
@@ -324,6 +327,48 @@ func TestHookPaths(t *testing.T) {
 	want := []string{transcript, filepath.Join(root, "projects", "p", "abc")}
 	if !slices.Equal(got, want) {
 		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+// A session closed before the first message has no transcript on disk
+func TestHookPathsNoTranscript(t *testing.T) {
+	root := t.TempDir()
+	transcript := filepath.Join(root, "projects", "p", "abc.jsonl")
+	in := strings.NewReader(`{"session_id":"abc","transcript_path":"` + transcript + `"}`)
+	got, err := hookPaths(in, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %v, want no paths", got)
+	}
+}
+
+// With nothing to redact, the hook must not fall back to the whole history
+func TestHookNoTranscript(t *testing.T) {
+	root := t.TempDir()
+	other, _ := writeTranscript(t, root)
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(root, "projects", "-tmp-app", "empty.jsonl")
+	if _, err := w.WriteString(`{"session_id":"empty","transcript_path":"` + missing + `"}`); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	stdin := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() { os.Stdin = stdin; r.Close() })
+
+	o := testOptions(root)
+	o.hook, o.minAge = true, 0
+	if err := scrub(context.Background(), o, nil); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(other); !strings.Contains(string(b), fakePassword) {
+		t.Error("the hook redacted another session")
 	}
 }
 

@@ -36,6 +36,10 @@ func scrub(ctx context.Context, o options, paths []string) error {
 		if paths, err = hookPaths(os.Stdin, o.root); err != nil {
 			return err
 		}
+		// No paths would mean the whole history
+		if len(paths) == 0 {
+			return nil
+		}
 		// Ending a session is the consent; stay quiet unless something
 		// was redacted or went wrong
 		o.force, o.quiet = true, true
@@ -215,8 +219,9 @@ func hookPaths(r io.Reader, root string) ([]string, error) {
 	if in.TranscriptPath == "" {
 		return nil, errors.New("hook input has no transcript_path")
 	}
-	paths := []string{in.TranscriptPath}
-	for _, p := range []string{strings.TrimSuffix(in.TranscriptPath, ".jsonl"), filepath.Join(root, "history.jsonl")} {
+	// A session that ended before the first message has no transcript yet
+	var paths []string
+	for _, p := range []string{in.TranscriptPath, strings.TrimSuffix(in.TranscriptPath, ".jsonl"), filepath.Join(root, "history.jsonl")} {
 		if _, err := os.Stat(p); err == nil {
 			paths = append(paths, p)
 		}
