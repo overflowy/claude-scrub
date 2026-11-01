@@ -106,11 +106,12 @@ type redaction struct {
 	// Lines (or the document) left untouched because redacting them would
 	// have made valid JSON invalid
 	skipped int
+	left    map[int]int // secret index -> occurrences in what was left untouched
 }
 
 // redact replaces every occurrence of a secret in data with its placeholder.
 func (r *replacer) redact(data []byte, kind fileKind) redaction {
-	res := redaction{counts: map[int]int{}}
+	res := redaction{counts: map[int]int{}, left: map[int]int{}}
 	hits := r.find(data, kind != kindText)
 	if len(hits) == 0 {
 		res.out = data
@@ -121,12 +122,13 @@ func (r *replacer) redact(data []byte, kind fileKind) redaction {
 	case kindText:
 		res.out = r.apply(data, hits, res.counts)
 	case kindJSONDoc:
-		out := r.apply(data, hits, map[int]int{})
+		counts := map[int]int{}
+		out := r.apply(data, hits, counts)
 		if json.Valid(data) && !json.Valid(out) {
-			res.out, res.skipped = data, 1
+			res.out, res.skipped, res.left = data, 1, counts
 			return res
 		}
-		res.out = r.apply(data, hits, res.counts)
+		res.out, res.counts = out, counts
 	case kindJSONLines:
 		var buf bytes.Buffer
 		buf.Grow(len(data))
@@ -158,6 +160,9 @@ func (r *replacer) redact(data []byte, kind fileKind) redaction {
 			if json.Valid(line) && !json.Valid(newLine) {
 				buf.Write(line)
 				res.skipped++
+				for k, v := range counts {
+					res.left[k] += v
+				}
 			} else {
 				buf.Write(newLine)
 				for k, v := range counts {

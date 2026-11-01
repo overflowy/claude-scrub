@@ -461,3 +461,54 @@ func TestLongLineWindows(t *testing.T) {
 		t.Errorf("got %v", got)
 	}
 }
+
+func TestSummarizeKnownValues(t *testing.T) {
+	secrets := []secret{
+		{value: "listed-and-present", label: "a", prio: prioKnown},
+		{value: "listed-and-absent", label: "b", prio: prioKnown},
+		{value: "listed-and-left-alone", label: "c", prio: prioKnown},
+		{value: "detected-unmatched", label: "d", prio: prioName},
+	}
+	s := summarize(secrets, []fileResult{{
+		path:    "f",
+		counts:  map[int]int{0: 2},
+		left:    map[int]int{2: 1},
+		skipped: 1,
+	}})
+	if s.found != 3 || s.occurrences != 2 {
+		t.Errorf("found %d, occurrences %d; want 3, 2", s.found, s.occurrences)
+	}
+	var labels []string
+	for _, l := range s.labels {
+		labels = append(labels, l.label)
+	}
+	slices.Sort(labels)
+	if want := []string{"a", "c", "d"}; !slices.Equal(labels, want) {
+		t.Errorf("labels %v, want %v", labels, want)
+	}
+}
+
+func TestRedactLeftAlone(t *testing.T) {
+	// The value's closing quote is the one ending "a": replacing it would
+	// leave that string unterminated
+	rep := newReplacer([]secret{{value: `abcd1234"`, label: "token"}})
+	line := `{"a":"abcd1234","b":"y"}`
+	for _, kind := range []fileKind{kindJSONDoc, kindJSONLines} {
+		red := rep.redact([]byte(line), kind)
+		if string(red.out) != line {
+			t.Errorf("kind %d: got %s", kind, red.out)
+		}
+		if red.skipped != 1 || red.left[0] != 1 || len(red.counts) != 0 {
+			t.Errorf("kind %d: skipped %d, left %v, counts %v", kind, red.skipped, red.left, red.counts)
+		}
+	}
+}
+
+func TestPlural(t *testing.T) {
+	if got := plural(1, "secret"); got != "1 secret" {
+		t.Errorf("got %q", got)
+	}
+	if got := plural(0, "secret"); got != "0 secrets" {
+		t.Errorf("got %q", got)
+	}
+}

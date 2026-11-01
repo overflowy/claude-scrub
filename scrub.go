@@ -23,6 +23,7 @@ const batchBytes = 256 * 1024
 type fileResult struct {
 	path    string
 	counts  map[int]int // secret index -> occurrences
+	left    map[int]int // secret index -> occurrences in those lines
 	skipped int         // JSON lines left alone to keep them valid
 	err     error
 }
@@ -82,7 +83,7 @@ func scrub(ctx context.Context, o options, paths []string) error {
 	for _, t := range disc.targets {
 		total += t.size
 	}
-	logf("Scanning %d files (%s)", len(disc.targets), humanBytes(total))
+	logf("Scanning %s (%s)", plural(len(disc.targets), "file"), humanBytes(total))
 	if disc.recent > 0 {
 		logf(", skipping %d modified in the last %s", disc.recent, o.minAge)
 	}
@@ -139,7 +140,6 @@ func scrub(ctx context.Context, o options, paths []string) error {
 	}
 	secrets := col.secrets(allow)
 	rep := newReplacer(secrets)
-	logf("Found %d secrets in %s\n", len(secrets), time.Since(start).Round(100*time.Millisecond))
 
 	// Pass 2: count, then redact once confirmed
 	results := redactAll(ctx, rep, disc.targets, o.jobs, false)
@@ -147,6 +147,7 @@ func scrub(ctx context.Context, o options, paths []string) error {
 		return ctx.Err()
 	}
 	sum := summarize(secrets, results)
+	logf("Found %s in %s\n", plural(sum.found, "secret"), time.Since(start).Round(100*time.Millisecond))
 
 	if o.jsonOut {
 		if err := printJSON(os.Stdout, sum, o, len(disc.targets)); err != nil {
@@ -157,21 +158,25 @@ func scrub(ctx context.Context, o options, paths []string) error {
 	}
 	if len(unreadable) > 0 {
 		sort.Strings(unreadable)
-		fmt.Fprintf(os.Stderr, "Could not read %d files:\n%s\n", len(unreadable), strings.Join(unreadable, "\n"))
+		fmt.Fprintf(os.Stderr, "Could not read %s:\n%s\n", plural(len(unreadable), "file"), strings.Join(unreadable, "\n"))
 	}
 	for _, label := range o.explain {
 		explain(os.Stderr, rep, sum, labelFor(label))
 	}
 
 	if sum.occurrences == 0 {
-		logf("Nothing to redact.\n")
+		if sum.found > 0 {
+			logf("None of these could be redacted. Nothing changed.\n")
+		} else {
+			logf("Nothing to redact.\n")
+		}
 		return nil
 	}
 	if !write {
-		logf("\nWould redact %d occurrences in %d files. Run without --dry-run to apply.\n", sum.occurrences, len(sum.files))
+		logf("\nWould redact %s in %s. Run without --dry-run to apply.\n", plural(sum.occurrences, "occurrence"), plural(len(sum.files), "file"))
 		return nil
 	}
-	if !o.force && !confirm(fmt.Sprintf("Redact %d occurrences in %d files? This cannot be undone. [y/N] ", sum.occurrences, len(sum.files))) {
+	if !o.force && !confirm(fmt.Sprintf("Redact %s in %s? This cannot be undone. [y/N] ", plural(sum.occurrences, "occurrence"), plural(len(sum.files), "file"))) {
 		logf("Nothing changed.\n")
 		return nil
 	}
@@ -197,12 +202,12 @@ func scrub(ctx context.Context, o options, paths []string) error {
 		return ctx.Err()
 	}
 	if o.hook && (done > 0 || len(failed) > 0) {
-		fmt.Fprintf(os.Stderr, "claude-scrub: redacted %d occurrences in %d files\n", occurrences, done)
+		fmt.Fprintf(os.Stderr, "claude-scrub: redacted %s in %s\n", plural(occurrences, "occurrence"), plural(done, "file"))
 	}
-	logf("Redacted %d occurrences in %d files.\n", occurrences, done)
+	logf("Redacted %s in %s.\n", plural(occurrences, "occurrence"), plural(done, "file"))
 	if len(failed) > 0 {
 		sort.Strings(failed)
-		return fmt.Errorf("could not redact %d files:\n%s", len(failed), strings.Join(failed, "\n"))
+		return fmt.Errorf("could not redact %s:\n%s", plural(len(failed), "file"), strings.Join(failed, "\n"))
 	}
 	return nil
 }
@@ -252,7 +257,7 @@ func redactFile(rep *replacer, path string, write bool) fileResult {
 			return res
 		}
 		red := rep.redact(data, kind)
-		res.counts, res.skipped = red.counts, red.skipped
+		res.counts, res.left, res.skipped = red.counts, red.left, red.skipped
 		if !write || len(red.counts) == 0 {
 			return res
 		}
@@ -302,12 +307,28 @@ type summary struct {
 	files       []fileSummary
 	occurrences int
 	skipped     int // JSON lines left alone
+	found       int // values in the report
 }
 
 func summarize(secrets []secret, results []fileResult) summary {
 	var s summary
+	present := make([]bool, len(secrets))
+	for _, r := range results {
+		for i := range r.counts {
+			present[i] = true
+		}
+		for i := range r.left {
+			present[i] = true
+		}
+	}
 	byLabel := map[string]*labelSummary{}
-	for _, sec := range secrets {
+	for i, sec := range secrets {
+		// Listed by the user rather than found, so absence is no finding. A
+		// detected value came from a file, so its absence is reported.
+		if sec.prio == prioKnown && !present[i] {
+			continue
+		}
+		s.found++
 		l := byLabel[sec.label]
 		if l == nil {
 			l = &labelSummary{label: sec.label, files: map[string]bool{}}
@@ -368,7 +389,7 @@ func printReport(w io.Writer, s summary, o options) {
 		}
 	}
 	if s.skipped > 0 {
-		fmt.Fprintf(w, "\nLeft %d JSON lines alone: redacting them would have broken the JSON.\n", s.skipped)
+		fmt.Fprintf(w, "\nLeft %s alone: redacting them would have broken the JSON.\n", plural(s.skipped, "JSON line"))
 	}
 }
 
@@ -449,7 +470,7 @@ func explain(w io.Writer, rep *replacer, s summary, label string) {
 		}
 	}
 	if !found {
-		fmt.Fprintln(w, "  no such label")
+		fmt.Fprintln(w, "  no values found")
 	}
 }
 
@@ -491,6 +512,13 @@ func displayPath(p string) string {
 		}
 	}
 	return p
+}
+
+func plural(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
 }
 
 func sumCounts(m map[int]int) int {
