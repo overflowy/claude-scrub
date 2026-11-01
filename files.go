@@ -50,7 +50,7 @@ func discoverHistory(root string, minAge time.Duration, now time.Time) (discover
 		}
 	}
 	for _, s := range starts {
-		if err := walkFiles(s, func(t target, info fs.FileInfo) {
+		if err := walkFiles(s, false, func(t target, info fs.FileInfo) {
 			if minAge > 0 && now.Sub(info.ModTime()) < minAge {
 				d.recent++
 				return
@@ -64,11 +64,11 @@ func discoverHistory(root string, minAge time.Duration, now time.Time) (discover
 }
 
 // discoverPaths lists the given files, and every file under the given
-// directories, whatever their age.
-func discoverPaths(paths []string) (discovery, error) {
+// directories, whatever their age. A missing path is an error if required.
+func discoverPaths(paths []string, required bool) (discovery, error) {
 	var d discovery
 	for _, p := range paths {
-		if err := walkFiles(p, func(t target, _ fs.FileInfo) {
+		if err := walkFiles(p, required, func(t target, _ fs.FileInfo) {
 			d.targets = append(d.targets, t)
 		}); err != nil {
 			return d, err
@@ -77,8 +77,14 @@ func discoverPaths(paths []string) (discovery, error) {
 	return d, nil
 }
 
-func walkFiles(root string, fn func(target, fs.FileInfo)) error {
+// walkFiles calls fn for each regular file under root. Files deleted along the
+// way are skipped, and so is root unless it was required: only a path the user
+// named has to exist.
+func walkFiles(root string, rootRequired bool, fn func(target, fs.FileInfo)) error {
 	return filepath.WalkDir(root, func(path string, e fs.DirEntry, err error) error {
+		if errors.Is(err, fs.ErrNotExist) && (path != root || !rootRequired) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
@@ -86,6 +92,9 @@ func walkFiles(root string, fn func(target, fs.FileInfo)) error {
 			return nil
 		}
 		info, err := e.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
@@ -131,27 +140,28 @@ func keywordLinesIn(f *lineFinder, data []byte, kind fileKind, add func(candidat
 		return f.lines(string(data))
 	}
 	var sb strings.Builder
-	ok := scanJSON(data, func(lit literal) {
-		if lit.isKey {
-			return
+	eachUnit(data, kind, func(unit []byte, _ int) {
+		ok := scanJSON(unit, func(lit literal) {
+			if lit.isKey {
+				return
+			}
+			raw := unit[lit.start:lit.end]
+			// Images and other blobs: long and without whitespace
+			if len(raw) > 32*1024 && !bytes.ContainsAny(raw, " \\") {
+				return
+			}
+			value := decodeJSONString(raw)
+			if lit.key != "" {
+				scanPair(lit.key, value, add)
+				sb.WriteString(`"` + lit.key + `": "`)
+			}
+			writeDecoded(&sb, raw, value)
+		})
+		// An unterminated string, or not JSON after all
+		if !ok || !looksLikeJSON(unit) {
+			writeRawUnit(&sb, unit)
 		}
-		raw := data[lit.start:lit.end]
-		// Images and other blobs: long and without whitespace
-		if len(raw) > 32*1024 && !bytes.ContainsAny(raw, " \\") {
-			return
-		}
-		value := decodeJSONString(raw)
-		if lit.key != "" {
-			scanPair(lit.key, value, add)
-			sb.WriteString(`"` + lit.key + `": "`)
-		}
-		sb.WriteString(value)
-		sb.WriteByte('\n')
 	})
-	if !ok {
-		// An unterminated string: not JSON after all, or cut short
-		return f.lines(string(data))
-	}
 	return f.lines(sb.String())
 }
 

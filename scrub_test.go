@@ -3,12 +3,16 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf16"
 )
 
 // Fake secrets, shaped like real ones
@@ -509,6 +513,533 @@ func TestPlural(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 	if got := plural(0, "secret"); got != "0 secrets" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestRedactDecodedForms(t *testing.T) {
+	// Spelled "\\u..." so the file holds the escape and not the character
+	const (
+		lower  = "\\u00e4"
+		upper  = "\\u00E4"
+		pEsc   = "\\u0070"
+		emoji  = "\\ud83d\\ude00"
+		nested = "\\\\u00e4"
+		tail   = "ssW0rd-Lantern-77"
+		ph     = "[REDACTED:password]"
+	)
+	value := "pä" + tail
+	cases := []struct {
+		name, value, in, want string
+		n                     int
+	}{
+		{"lowercase hex", value, `{"a":"p` + lower + tail + `"}`, `{"a":"` + ph + `"}`, 1},
+		{"uppercase hex", value, `{"a":"p` + upper + tail + `"}`, `{"a":"` + ph + `"}`, 1},
+		{"escaped ASCII", value, `{"a":"` + pEsc + lower + tail + `"}`, `{"a":"` + ph + `"}`, 1},
+		{"escaped slash", "ab/cd+Ef12/gh", `{"a":"ab\/cd+Ef12\/gh"}`, `{"a":"` + ph + `"}`, 1},
+		{"surrogate pair", "Key\U0001F600Lantern77", `{"a":"Key` + emoji + `Lantern77"}`, `{"a":"` + ph + `"}`, 1},
+		{"text around it", value, `{"a":"x\np` + lower + tail + `\ty"}`, `{"a":"x\n` + ph + `\ty"}`, 1},
+		{"JSON in JSON", value, `{"a":"{\"b\":\"p` + nested + tail + `\"}"}`, `{"a":"{\"b\":\"` + ph + `\"}"}`, 1},
+		{"both spellings", value, `{"a":"p` + lower + tail + `","b":"` + value + `"}`, `{"a":"` + ph + `","b":"` + ph + `"}`, 2},
+		{"key", value, `{"p` + lower + tail + `":"a"}`, `{"` + ph + `":"a"}`, 1},
+		{"other value", value, `{"a":"p` + lower + `ssW0rd-Lantern-78"}`, `{"a":"p` + lower + `ssW0rd-Lantern-78"}`, 0},
+		{"escape before it", "nabc12345XY", `{"a":"x\nabc12345XY` + lower + `"}`, `{"a":"x\nabc12345XY` + lower + `"}`, 0},
+	}
+	for _, c := range cases {
+		rep := newReplacer([]secret{{value: c.value, label: "password"}})
+		for _, kind := range []fileKind{kindJSONDoc, kindJSONLines} {
+			red := rep.redact([]byte(c.in), kind)
+			if string(red.out) != c.want {
+				t.Errorf("%s, kind %d: got %s, want %s", c.name, kind, red.out, c.want)
+			}
+			if !json.Valid(red.out) {
+				t.Errorf("%s, kind %d: invalid JSON: %s", c.name, kind, red.out)
+			}
+			if got := sumCounts(red.counts); got != c.n {
+				t.Errorf("%s, kind %d: redacted %d occurrences, want %d", c.name, kind, got, c.n)
+			}
+		}
+	}
+}
+
+func TestScrubEscapedValue(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "s.jsonl")
+	in := `{"password":"p` + "\\u00e4" + `ssW0rd-Lantern-77"}` + "\n"
+	if err := os.WriteFile(path, []byte(in), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := scrub(context.Background(), testOptions(root), []string{path}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"password":"[REDACTED:password]"}` + "\n"; string(got) != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+}
+
+func TestRedactFileVanished(t *testing.T) {
+	rep := newReplacer([]secret{{value: fakePassword, label: "password"}})
+	res := redactFile(rep, filepath.Join(t.TempDir(), "gone.jsonl"), true)
+	if res.err != nil || len(res.counts) != 0 {
+		t.Errorf("err %v, counts %v", res.err, res.counts)
+	}
+}
+
+func TestWriteAtomicVanished(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAtomic(path, []byte("y"), info); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("got %v, want a not-exist error", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("file came back: %v", err)
+	}
+}
+
+func TestDiscoverMissingPaths(t *testing.T) {
+	dir := t.TempDir()
+	gone := filepath.Join(dir, "gone")
+	if _, err := discoverPaths([]string{gone}, true); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("named path: got %v, want a not-exist error", err)
+	}
+	// A hook path or history path deleted after it was listed
+	keep := filepath.Join(dir, "keep.jsonl")
+	if err := os.WriteFile(keep, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d, err := discoverPaths([]string{gone, keep}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.targets) != 1 || d.targets[0].path != keep {
+		t.Errorf("targets %v", d.targets)
+	}
+}
+
+func TestDecodeMapped(t *testing.T) {
+	bs := "\\"
+	for _, body := range []string{
+		"plain", bs + "n", "a" + bs + "nb", bs, "a" + bs, bs + "x", bs + "u12", bs + "uZZZZ",
+		bs + "u00e4x", bs + "ud83d", bs + "ud83dabc", bs + "ud83d" + bs + "n", bs + "ud83d" + bs + "ude00z",
+		bs + bs + "u00e4", bs + "/" + bs + bs + bs + `"`,
+	} {
+		out, offs := decodeMapped([]byte(body))
+		if want := decodeJSONString([]byte(`"` + body + `"`)); string(out) != want {
+			t.Errorf("%s: got %q, want %q", body, out, want)
+		}
+		if len(offs) != len(out)+1 || offs[len(out)] != len(body) || !slices.IsSorted(offs) {
+			t.Errorf("%s: bad offsets %v for %q", body, offs, out)
+		}
+	}
+	out, offs := decodeMapped([]byte("a" + bs + "u00e4" + bs + "nb"))
+	if want := []int{0, 1, 1, 7, 9, 10}; string(out) != "aä\nb" || !slices.Equal(offs, want) {
+		t.Errorf("got %q %v, want offsets %v", out, offs, want)
+	}
+}
+
+func TestRedactEveryCharEscaped(t *testing.T) {
+	spell := func(v string) string {
+		var sb strings.Builder
+		for _, c := range utf16.Encode([]rune(v)) {
+			fmt.Fprintf(&sb, "\\u%04x", c)
+		}
+		return sb.String()
+	}
+	for _, value := range []string{fakePassword, fakeAPIKey, `pa"ss\word99`, "tab\there/slash", "Käy\U0001F600Lantern77"} {
+		rep := newReplacer([]secret{{value: value, label: "password"}})
+		line := `{"a":"before ` + spell(value) + ` after","b":"x\ny"}`
+		red := rep.redact([]byte(line), kindJSONLines)
+		want := `{"a":"before [REDACTED:password] after","b":"x\ny"}`
+		if string(red.out) != want {
+			t.Errorf("%q: got %s", value, red.out)
+		}
+		if red.skipped != 0 || sumCounts(red.counts) != 1 {
+			t.Errorf("%q: skipped %d, counts %v", value, red.skipped, red.counts)
+		}
+	}
+}
+
+func TestScrubNestedEscapedValue(t *testing.T) {
+	const nested = "\\\\u00e4" // a backslash pair, as JSON in JSON writes it
+	cases := []struct{ name, in, want string }{
+		{
+			"JSON in JSON",
+			`{"a":"{\"password\":\"p` + nested + `ssW0rd-Lantern-77\"}"}`,
+			`{"a":"{\"password\":\"[REDACTED:password]\"}"}`,
+		},
+		{
+			"escaped slash",
+			`{"a":"{\"token\":\"ab\\/cd+Ef12\\/ghIJ\"}"}`,
+			`{"a":"{\"token\":\"[REDACTED:token]\"}"}`,
+		},
+		{
+			"assignment in text",
+			`{"a":"run with\nDB_PASSWORD=p` + nested + `ssW0rd-Lantern-77\nthen stop"}`,
+			`{"a":"run with\nDB_PASSWORD=[REDACTED:db_password]\nthen stop"}`,
+		},
+		{
+			"code stays",
+			`{"a":"token = process.env.API_KEY\\u0021"}`,
+			`{"a":"token = process.env.API_KEY\\u0021"}`,
+		},
+	}
+	for _, c := range cases {
+		root := t.TempDir()
+		path := filepath.Join(root, "s.jsonl")
+		if err := os.WriteFile(path, []byte(c.in+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		o := testOptions(root)
+		if err := scrub(context.Background(), o, []string{path}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != c.want+"\n" {
+			t.Errorf("%s: got %s, want %s", c.name, got, c.want)
+		}
+	}
+}
+
+func TestDecodeLiteralsNested(t *testing.T) {
+	data := []byte(`{"a":"{\"b\":\"p` + "\\\\u00e4" + `ss\"}"}`)
+	if got := decodeLiterals(data, kindJSONLines); !strings.Contains(got, `{"b":"päss"}`) {
+		t.Errorf("nested form missing from %q", got)
+	}
+}
+
+func explainOutput(t *testing.T, content string, secrets []secret, label string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rep := newReplacer(secrets)
+	sum := summarize(secrets, []fileResult{redactFile(rep, path, false)})
+	var out strings.Builder
+	explain(&out, rep, sum, label)
+	return out.String()
+}
+
+func TestExplainHidesEscapedSpellings(t *testing.T) {
+	const tail = "ssW0rd-Lantern-77"
+	in := `{"a":"{\"password\":\"p` + "\\\\u00e4" + tail + `\"}"}` + "\n"
+	got := explainOutput(t, in, []secret{{value: "pä" + tail, label: "password"}}, "password")
+	if strings.Contains(got, tail) {
+		t.Errorf("secret shown: %s", got)
+	}
+	if !strings.Contains(got, "[REDACTED:password]") {
+		t.Errorf("no placeholder: %s", got)
+	}
+}
+
+func TestExplainHidesSecretAtWindowEdge(t *testing.T) {
+	// The window reaches 80 bytes either side of the explained value, which
+	// falls in the middle of each neighbour
+	before, after := "Wobbly-Teapot-Lantern-Quiver4", "Fuzzy-Walnut-Harbor-Candle-Nine8"
+	explained := "Zq8vN2mXk5LpR7tY"
+	pad := strings.Repeat(" ", 66)
+	in := `{"a":"` + before + pad + explained + pad + after + `"}` + "\n"
+	secrets := []secret{
+		{value: before, label: "first"},
+		{value: explained, label: "middle"},
+		{value: after, label: "last"},
+	}
+	got := explainOutput(t, in, secrets, "middle")
+	for _, part := range []string{"Quiver4", "Lantern", "Fuzzy", "Walnut"} {
+		if strings.Contains(got, part) {
+			t.Errorf("fragment %q shown: %s", part, got)
+		}
+	}
+	for _, label := range []string{"first", "last", "middle"} {
+		if !strings.Contains(got, "[REDACTED:"+label+"]") {
+			t.Errorf("no placeholder for %s: %s", label, got)
+		}
+	}
+}
+
+// Spellings of ä at growing depth, in bytes as they sit in the file
+const (
+	escOnce   = "\\u00e4"
+	escTwice  = "\\\\u00e4"
+	escThrice = "\\\\\\\\u00e4"
+	testTail  = "ssW0rd-Lantern-77"
+	testValue = "pä" + testTail
+	testPH    = "[REDACTED:password]"
+)
+
+func passwordReplacer() *replacer {
+	return newReplacer([]secret{{value: testValue, label: "password"}})
+}
+
+func TestRedactTornLines(t *testing.T) {
+	good := `{"b":"before p` + escOnce + testTail + ` after"}`
+	goodOut := `{"b":"before ` + testPH + ` after"}`
+	cases := []struct{ name, in, want string }{
+		{"torn line first", `{"a":"trunc` + "\n" + good + "\n", `{"a":"trunc` + "\n" + goodOut + "\n"},
+		{"torn line between", good + "\n" + `{"a":"trunc` + "\n" + good, goodOut + "\n" + `{"a":"trunc` + "\n" + goodOut},
+		{"secret in the torn line", `{"b":"before p` + escOnce + testTail + ` aft`, `{"b":"before ` + testPH + ` aft`},
+	}
+	rep := passwordReplacer()
+	for _, c := range cases {
+		for _, kind := range []fileKind{kindJSONLines, kindJSONDoc} {
+			if got := rep.redact([]byte(c.in), kind).out; string(got) != c.want {
+				t.Errorf("%s, kind %d: got %s, want %s", c.name, kind, got, c.want)
+			}
+		}
+	}
+}
+
+func scrubFile(t *testing.T, name, content string) string {
+	t.Helper()
+	root := t.TempDir()
+	path := filepath.Join(root, name)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := scrub(context.Background(), testOptions(root), []string{path}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(got)
+}
+
+func TestDetectAroundTornLines(t *testing.T) {
+	nested := `{"a":"{\"password\":\"p` + escTwice + testTail + `\"}"}`
+	nestedOut := `{"a":"{\"password\":\"` + testPH + `\"}"}`
+	cases := []struct{ name, file, in, want string }{
+		{"nested, then torn", "s.jsonl", nested + "\n" + `{"a":"trunc`, nestedOut + "\n" + `{"a":"trunc`},
+		{"torn, then nested", "s.jsonl", `{"a":"trunc` + "\n" + nested + "\n", `{"a":"trunc` + "\n" + nestedOut + "\n"},
+		{"nested in the torn line", "s.jsonl", `{"a":"{\"password\":\"p` + escTwice + testTail + `\"`, `{"a":"{\"password\":\"` + testPH + `\"`},
+		{"plain in a torn line", "s.jsonl", `{"a":"DB_PASSWORD=` + fakePassword + ` aft`, `{"a":"DB_PASSWORD=[REDACTED:db_password] aft`},
+		{
+			"outside strings in a broken file", "notes.txt",
+			"[x]\nTOKEN=" + fakePassword + "\n\"unterminated\n",
+			"[x]\nTOKEN=[REDACTED:token]\n\"unterminated\n",
+		},
+		{
+			"pair across lines in a document", "c.json",
+			"{\n  \"password\":\n    \"" + fakePassword + "\"\n}\n",
+			"{\n  \"password\":\n    \"[REDACTED:password]\"\n}\n",
+		},
+	}
+	for _, c := range cases {
+		if got := scrubFile(t, c.file, c.in); got != c.want {
+			t.Errorf("%s: got %s, want %s", c.name, got, c.want)
+		}
+	}
+}
+
+func TestRedactTextSpellings(t *testing.T) {
+	cases := []struct{ name, value, in, want string }{
+		{"escaped slash", "abcdefgh12/xyzQRS", `resp {"token":"abcdefgh12\/xyzQRS"} ok`, `resp {"token":"` + testPH + `"} ok`},
+		{"unicode", testValue, "log: p" + escOnce + testTail + " done\nnext\n", "log: " + testPH + " done\nnext\n"},
+		{"JSON in JSON", testValue, `log {"a":"p` + escTwice + testTail + `"}`, `log {"a":"` + testPH + `"}`},
+		{"plain still works", testValue, "log: " + testValue, "log: " + testPH},
+		{"other text stays", testValue, `path C:\users\me p` + escOnce + `ss`, `path C:\users\me p` + escOnce + `ss`},
+	}
+	for _, c := range cases {
+		rep := newReplacer([]secret{{value: c.value, label: "password"}})
+		if got := rep.redact([]byte(c.in), kindText).out; string(got) != c.want {
+			t.Errorf("%s: got %s, want %s", c.name, got, c.want)
+		}
+	}
+}
+
+func TestRedactDeepNesting(t *testing.T) {
+	rep := passwordReplacer()
+	in := `{"a":"p` + escThrice + testTail + `"}`
+	want := `{"a":"` + testPH + `"}`
+	if got := rep.redact([]byte(in), kindJSONLines).out; string(got) != want {
+		t.Errorf("third level: got %s, want %s", got, want)
+	}
+	// A value needing escapes, spelled the usual way three levels down
+	value := `pa"ss\word99`
+	spelled := jsonEscape(jsonEscape(jsonEscape(value)))
+	rep = newReplacer([]secret{{value: value, label: "password"}})
+	if got := rep.redact([]byte(`{"a":"`+spelled+`"}`), kindJSONLines).out; string(got) != want {
+		t.Errorf("canonical third level: got %s, want %s", got, want)
+	}
+	// Decoding has to stop on an escape it cannot resolve
+	stuck := `{"a":"C:\\users\\uZZZZ"}`
+	if got := rep.redact([]byte(stuck), kindJSONLines).out; string(got) != stuck {
+		t.Errorf("got %s", got)
+	}
+}
+
+func TestDetectDeepNesting(t *testing.T) {
+	// A transcript read into a session: JSON in JSON in JSON
+	in := `{"a":"{\"b\":\"{\\\"password\\\":\\\"p` + escThrice + testTail + `\\\"}\"}"}` + "\n"
+	want := `{"a":"{\"b\":\"{\\\"password\\\":\\\"` + testPH + `\\\"}\"}"}` + "\n"
+	if got := scrubFile(t, "s.jsonl", in); got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+}
+
+func TestRedactOverlappingSecrets(t *testing.T) {
+	secrets := []secret{{value: "AAAAAAAABBBBBBBB", label: "one"}, {value: "BBBBBBBBCCCCCCCC", label: "two"}}
+	rep := newReplacer(secrets)
+	red := rep.redact([]byte("x AAAAAAAABBBBBBBBCCCCCCCC y"), kindText)
+	if want := "x [REDACTED:one] y"; string(red.out) != want {
+		t.Errorf("got %s, want %s", red.out, want)
+	}
+	if red.counts[0] != 1 || red.counts[1] != 1 {
+		t.Errorf("counts %v, want one of each", red.counts)
+	}
+	got := explainOutput(t, `{"a":"x AAAAAAAABBBBBBBBCCCCCCCC y"}`+"\n", secrets, "two")
+	if strings.Contains(got, "CCCC") {
+		t.Errorf("fragment shown: %s", got)
+	}
+	// The same secret found twice over is one occurrence
+	rep = passwordReplacer()
+	red = rep.redact([]byte(`{"a":"`+testValue+`","b":"p`+escOnce+testTail+`"}`), kindJSONLines)
+	if red.counts[0] != 2 {
+		t.Errorf("counts %v, want 2", red.counts)
+	}
+}
+
+func TestRedactNestedEscapes(t *testing.T) {
+	const value = "nabc12345XY"
+	ph := "[REDACTED:password]"
+	cases := []struct {
+		name, in, want string
+		n, left        int
+	}{
+		// Not the secret: a newline in the inner JSON, then abc12345XY
+		{"inner newline", `{"a":"{\"b\":\"line\\nabc12345XY\"}"}`, `{"a":"{\"b\":\"line\\nabc12345XY\"}"}`, 0, 1},
+		{"inner newline, other escape", `{"a":"{\"b\":\"line\\nabc12345XY` + escTwice + `\"}"}`, `{"a":"{\"b\":\"line\\nabc12345XY` + escTwice + `\"}"}`, 0, 1},
+		{"third level newline", `{"a":"{\"b\":\"{\\\"c\\\":\\\"line\\\\nabc12345XY\\\"}\"}"}`, `{"a":"{\"b\":\"{\\\"c\\\":\\\"line\\\\nabc12345XY\\\"}\"}"}`, 0, 1},
+		// The real one beside it still goes
+		{"real one beside it", `{"a":"{\"b\":\"line\\nabc12345XY\",\"c\":\"nabc12345XY\"}"}`, `{"a":"{\"b\":\"line\\nabc12345XY\",\"c\":\"` + ph + `\"}"}`, 1, 1},
+		// A real backslash in the inner string: this is the secret
+		{"inner path", `{"a":"{\"p\":\"C:\\\\nabc12345XY\"}"}`, `{"a":"{\"p\":\"C:\\\\` + ph + `\"}"}`, 1, 0},
+		// Not JSON inside, so there is nothing to keep valid
+		{"plain text path", `{"a":"path C:\\nabc12345XY here"}`, `{"a":"path C:\\` + ph + ` here"}`, 1, 0},
+		{"plain nested value", `{"a":"{\"c\":\"nabc12345XY\"}"}`, `{"a":"{\"c\":\"` + ph + `\"}"}`, 1, 0},
+	}
+	rep := newReplacer([]secret{{value: value, label: "password"}})
+	for _, c := range cases {
+		for _, kind := range []fileKind{kindJSONLines, kindJSONDoc} {
+			red := rep.redact([]byte(c.in), kind)
+			if string(red.out) != c.want {
+				t.Errorf("%s, kind %d: got %s, want %s", c.name, kind, red.out, c.want)
+			}
+			if got := sumCounts(red.counts); got != c.n {
+				t.Errorf("%s, kind %d: redacted %d, want %d", c.name, kind, got, c.n)
+			}
+			if got := sumCounts(red.left); got != c.left {
+				t.Errorf("%s, kind %d: left %d, want %d", c.name, kind, got, c.left)
+			}
+			if (red.skipped > 0) != (c.left > 0) {
+				t.Errorf("%s, kind %d: skipped %d with %d left", c.name, kind, red.skipped, c.left)
+			}
+		}
+	}
+}
+
+func TestExplainMatchesWhatRedactDoes(t *testing.T) {
+	// A text file: --explain and the rewrite have to agree on what goes
+	root := t.TempDir()
+	path := filepath.Join(root, "log.txt")
+	in := `log: {"b":"p` + escOnce + testTail + `"}` + "\n"
+	if err := os.WriteFile(path, []byte(in), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secrets := []secret{{value: testValue, label: "password"}}
+	rep := newReplacer(secrets)
+	red := redactFile(rep, path, false)
+	if sumCounts(red.counts) != 1 {
+		t.Fatalf("counts %v, want 1", red.counts)
+	}
+	var out strings.Builder
+	explain(&out, rep, summarize(secrets, []fileResult{red}), "password")
+	if got := out.String(); strings.Contains(got, testTail) || !strings.Contains(got, testPH) {
+		t.Errorf("explain: %s", got)
+	}
+	if strings.Contains(out.String(), "no occurrence") {
+		t.Errorf("explain missed it: %s", out.String())
+	}
+	if err := scrub(context.Background(), testOptions(root), []string{path}); err != nil {
+		t.Fatal(err)
+	}
+	o := testOptions(root)
+	o.secrets = filepath.Join(root, "secrets")
+	if err := os.WriteFile(o.secrets, []byte("password="+testValue+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := scrub(context.Background(), o, []string{path}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(path); strings.Contains(string(got), testTail) {
+		t.Errorf("explain showed a placeholder but the file holds the secret: %s", got)
+	}
+}
+
+func FuzzRedact(f *testing.F) {
+	for _, s := range []string{
+		`{"a":"pässW0rd-Lantern-77"}`,
+		`{"a":"{\"b\":\"line\\nabc12345XY\\u00e4\"}"}`,
+		`{"a":"trunc` + "\n" + `{"b":"nabc12345XY\/"}`,
+		`{"a":"😀\ud83d\\\\\u"}`,
+		`text \ \u \\u00e4 nabc12345XY`,
+	} {
+		f.Add(s, "nabc12345XY")
+		f.Add(s, "pä"+testTail)
+		f.Add(s, `q"\/`)
+	}
+	f.Fuzz(func(t *testing.T, data, value string) {
+		if len(value) < 3 {
+			return
+		}
+		rep := newReplacer([]secret{{value: value, label: "x"}, {value: value + "tail", label: "y"}})
+		for _, kind := range []fileKind{kindText, kindJSONLines, kindJSONDoc} {
+			in := []byte(data)
+			red := rep.redact(in, kind)
+			if kind == kindJSONDoc && json.Valid(in) && !json.Valid(red.out) {
+				t.Fatalf("document went invalid: %s -> %s", in, red.out)
+			}
+			if kind == kindJSONLines {
+				before, after := strings.Split(data, "\n"), strings.Split(string(red.out), "\n")
+				if len(before) == len(after) {
+					for i := range before {
+						if json.Valid([]byte(before[i])) && !json.Valid([]byte(after[i])) {
+							t.Fatalf("line went invalid: %s -> %s", before[i], after[i])
+						}
+					}
+				}
+			}
+			hits := rep.findAll([]byte(data), kindText)
+			if len(data) > 0 {
+				rep.snippet(data, hits, 0, len(data)/2, 80)
+			}
+		}
+	})
+}
+
+func TestRedactSecretOnLineBreak(t *testing.T) {
+	// Starts on the newline ending a line, so it cannot sit inside one JSON
+	// line. Found by fuzzing: this used to loop forever.
+	rep := newReplacer([]secret{{value: "\n000", label: "x"}})
+	in := "000\n000\nA\n000"
+	if got := rep.redact([]byte(in), kindJSONLines).out; string(got) != in {
 		t.Errorf("got %q", got)
 	}
 }

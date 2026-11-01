@@ -1,11 +1,17 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"slices"
 	"strings"
 	"unicode/utf16"
 	"unicode/utf8"
 )
+
+// maxDepth is how many levels of JSON inside JSON strings are looked through. A
+// session reading an old transcript already holds JSON three levels down.
+const maxDepth = 5
 
 // literal is a JSON string literal; start and end are raw byte offsets
 // including the quotes.
@@ -88,47 +94,126 @@ func looksLikeJSON(data []byte) bool {
 // decodeJSONString decodes a raw JSON string literal, quotes included. Invalid
 // escapes are kept as they are and lone surrogates become U+FFFD.
 func decodeJSONString(raw []byte) string {
-	body := raw[1 : len(raw)-1]
+	return decodeBody(raw[1 : len(raw)-1])
+}
+
+// writeDecoded writes value, the decoded form of raw, followed by what further
+// decoding reveals: JSON inside a JSON string can spell a value with an escape
+// jsonEscape would not write, and the rules stop at the backslash.
+func writeDecoded(sb *strings.Builder, raw []byte, value string) {
+	sb.WriteString(value)
+	sb.WriteByte('\n')
+	// Such an escape in value is in raw too, so most literals stop here
+	if !hasOtherEscape(raw) {
+		return
+	}
+	cur := []byte(value)
+	for range maxDepth - 1 {
+		if !hasOtherEscape(cur) {
+			return
+		}
+		next := decodeInto(cur, nil)
+		if bytes.Equal(next, cur) {
+			return
+		}
+		sb.Write(next)
+		sb.WriteByte('\n')
+		cur = next
+	}
+}
+
+// writeRawUnit writes a unit that scanJSON cannot fully account for, as is and
+// decoded: it may hold secrets outside any string it could read.
+func writeRawUnit(sb *strings.Builder, unit []byte) {
+	sb.Write(unit)
+	sb.WriteByte('\n')
+	if slices.Contains(unit, '\\') {
+		writeDecoded(sb, unit, decodeBody(unit))
+	}
+}
+
+// eachUnit calls fn with each part of data to parse on its own, and its offset.
+// Strings in valid JSON cannot span lines, so apart from a valid document data
+// goes line by line: a line cut short by a crash then only affects itself,
+// instead of pairing up the quotes of every line after it the wrong way.
+func eachUnit(data []byte, kind fileKind, fn func(unit []byte, base int)) {
+	if kind == kindJSONDoc && json.Valid(data) {
+		fn(data, 0)
+		return
+	}
+	for start := 0; start < len(data); {
+		end := len(data)
+		if i := bytes.IndexByte(data[start:], '\n'); i >= 0 {
+			end = start + i
+		}
+		if end > start {
+			fn(data[start:end], start)
+		}
+		start = end + 1
+	}
+}
+
+// decodeBody decodes the body of a JSON string, without its quotes.
+func decodeBody(body []byte) string {
 	if !slices.Contains(body, '\\') {
 		return string(body)
 	}
-	var sb strings.Builder
-	sb.Grow(len(body))
-	for i := 0; i < len(body); i++ {
-		c := body[i]
-		if c != '\\' || i+1 >= len(body) {
-			sb.WriteByte(c)
-			continue
+	return string(decodeInto(body, nil))
+}
+
+// decodeMapped decodes the body of a JSON string like decodeBody, and also
+// returns where each decoded byte came from: offs[i] is the offset in body of
+// the escape or byte that produced byte i, and offs[len(out)] is len(body).
+// Offsets always fall on escape boundaries.
+func decodeMapped(body []byte) (out []byte, offs []int) {
+	offs = make([]int, 0, len(body)+1)
+	out = decodeInto(body, &offs)
+	return out, append(offs, len(body))
+}
+
+// decodeInto decodes body, and records the offsets of decodeMapped if asked.
+func decodeInto(body []byte, offs *[]int) []byte {
+	out := make([]byte, 0, len(body))
+	for i := 0; i < len(body); {
+		before, n := len(out), 1
+		if body[i] == '\\' && i+1 < len(body) {
+			out, n = appendEscape(out, body[i:])
+		} else {
+			out = append(out, body[i])
 		}
-		i++
-		switch body[i] {
-		case '"', '\\', '/':
-			sb.WriteByte(body[i])
-		case 'b':
-			sb.WriteByte('\b')
-		case 'f':
-			sb.WriteByte('\f')
-		case 'n':
-			sb.WriteByte('\n')
-		case 'r':
-			sb.WriteByte('\r')
-		case 't':
-			sb.WriteByte('\t')
-		case 'u':
-			r, n := decodeUnicodeEscape(body[i-1:])
-			if n == 0 {
-				sb.WriteByte('\\')
-				sb.WriteByte('u')
-				continue
+		if offs != nil {
+			for range len(out) - before {
+				*offs = append(*offs, i)
 			}
-			sb.WriteRune(r)
-			i += n - 2
-		default:
-			sb.WriteByte('\\')
-			sb.WriteByte(body[i])
+		}
+		i += n
+	}
+	return out
+}
+
+// appendEscape decodes the escape at the start of b, which holds a backslash
+// and at least one more byte. It returns dst with the result appended and the
+// number of bytes consumed.
+func appendEscape(dst, b []byte) ([]byte, int) {
+	switch b[1] {
+	case '"', '\\', '/':
+		return append(dst, b[1]), 2
+	case 'b':
+		return append(dst, '\b'), 2
+	case 'f':
+		return append(dst, '\f'), 2
+	case 'n':
+		return append(dst, '\n'), 2
+	case 'r':
+		return append(dst, '\r'), 2
+	case 't':
+		return append(dst, '\t'), 2
+	case 'u':
+		if r, n := decodeUnicodeEscape(b); n > 0 {
+			return utf8.AppendRune(dst, r), n
 		}
 	}
-	return sb.String()
+	return append(dst, b[0], b[1]), 2
 }
 
 // decodeUnicodeEscape decodes \uXXXX (and a following low surrogate) at the

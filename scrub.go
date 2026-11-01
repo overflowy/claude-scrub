@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -24,7 +25,7 @@ type fileResult struct {
 	path    string
 	counts  map[int]int // secret index -> occurrences
 	left    map[int]int // secret index -> occurrences in those lines
-	skipped int         // JSON lines left alone to keep them valid
+	skipped int         // JSON lines with matches left to keep them valid
 	err     error
 }
 
@@ -70,7 +71,7 @@ func scrub(ctx context.Context, o options, paths []string) error {
 
 	var disc discovery
 	if len(paths) > 0 {
-		disc, err = discoverPaths(paths)
+		disc, err = discoverPaths(paths, !o.hook)
 	} else {
 		disc, err = discoverHistory(o.root, o.minAge, time.Now())
 	}
@@ -113,6 +114,10 @@ func scrub(ctx context.Context, o options, paths []string) error {
 	var mu sync.Mutex
 	forEach(ctx, disc.targets, o.jobs, func(_ int, t target) {
 		data, kind, _, err := readTarget(t.path)
+		// Deleted since it was listed
+		if errors.Is(err, fs.ErrNotExist) {
+			return
+		}
 		if err != nil {
 			mu.Lock()
 			unreadable = append(unreadable, fmt.Sprintf("  %s: %v", displayPath(t.path), err))
@@ -252,6 +257,9 @@ func redactFile(rep *replacer, path string, write bool) fileResult {
 	res := fileResult{path: path}
 	for range 3 {
 		data, kind, info, err := readTarget(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			return fileResult{path: path}
+		}
 		if err != nil || data == nil {
 			res.err = err
 			return res
@@ -261,7 +269,11 @@ func redactFile(rep *replacer, path string, write bool) fileResult {
 		if !write || len(red.counts) == 0 {
 			return res
 		}
-		if res.err = writeAtomic(path, red.out, info); !errors.Is(res.err, errChanged) {
+		res.err = writeAtomic(path, red.out, info)
+		if errors.Is(res.err, fs.ErrNotExist) {
+			return fileResult{path: path}
+		}
+		if !errors.Is(res.err, errChanged) {
 			return res
 		}
 	}
@@ -306,7 +318,7 @@ type summary struct {
 	labels      []*labelSummary
 	files       []fileSummary
 	occurrences int
-	skipped     int // JSON lines left alone
+	skipped     int // JSON lines with matches left in place
 	found       int // values in the report
 }
 
@@ -389,7 +401,7 @@ func printReport(w io.Writer, s summary, o options) {
 		}
 	}
 	if s.skipped > 0 {
-		fmt.Fprintf(w, "\nLeft %s alone: redacting them would have broken the JSON.\n", plural(s.skipped, "JSON line"))
+		fmt.Fprintf(w, "\nLeft matches in %s: redacting them would have broken the JSON.\n", plural(s.skipped, "JSON line"))
 	}
 }
 
@@ -436,6 +448,27 @@ func printJSON(w io.Writer, s summary, o options, scanned int) error {
 // occurrence with every secret in it redacted.
 func explain(w io.Writer, rep *replacer, s summary, label string) {
 	const around = 80
+	type explainText struct {
+		text string
+		hits []hit
+	}
+	// A label can have many values in the same few files
+	texts := map[string]*explainText{}
+	load := func(path string) *explainText {
+		if t, ok := texts[path]; ok {
+			return t
+		}
+		var t *explainText
+		if data, kind, _, err := readTarget(path); err == nil && data != nil {
+			text := string(data)
+			if kind != kindText {
+				text = decodeLiterals(data, kind)
+			}
+			t = &explainText{text: text, hits: rep.findAll([]byte(text), kindText)}
+		}
+		texts[path] = t
+		return t
+	}
 	fmt.Fprintf(w, "\n%s:\n", label)
 	found := false
 	for _, l := range s.labels {
@@ -449,21 +482,16 @@ func explain(w io.Writer, rep *replacer, s summary, label string) {
 				if f.labels[label] == 0 {
 					continue
 				}
-				data, kind, _, err := readTarget(f.path)
-				if err != nil || data == nil {
+				t := load(f.path)
+				if t == nil {
 					continue
 				}
-				text := string(data)
-				if kind != kindText {
-					text = decodeLiterals(data)
-				}
-				at := strings.Index(text, v)
-				if at < 0 {
+				start, end := locate(rep, t.text, t.hits, v)
+				if start < 0 {
 					continue
 				}
-				lo, hi := max(0, at-around), min(len(text), at+len(v)+around)
-				red := rep.redact([]byte(strings.ToValidUTF8(text[lo:hi], "")), kindText)
-				snippet = fmt.Sprintf("%s\n      %s", displayPath(f.path), strings.Join(strings.Fields(string(red.out)), " "))
+				shown := rep.snippet(t.text, t.hits, start, end, around)
+				snippet = fmt.Sprintf("%s\n      %s", displayPath(f.path), strings.Join(strings.Fields(shown), " "))
 				break
 			}
 			fmt.Fprintf(w, "  %d. %s\n", i+1, snippet)
@@ -474,15 +502,32 @@ func explain(w io.Writer, rep *replacer, s summary, label string) {
 	}
 }
 
-// decodeLiterals joins the decoded string literals of a JSON file.
-func decodeLiterals(data []byte) string {
-	var sb strings.Builder
-	scanJSON(data, func(lit literal) {
-		if lit.key != "" {
-			sb.WriteString(lit.key + ": ")
+// locate returns where value first occurs in text: its hit, which covers any
+// spelling, or if a longer secret swallowed that hit, the plain value.
+func locate(rep *replacer, text string, hits []hit, value string) (start, end int) {
+	for _, h := range hits {
+		if rep.secrets[h.secret].value == value {
+			return h.start, h.end
 		}
-		sb.WriteString(decodeJSONString(data[lit.start:lit.end]))
-		sb.WriteByte('\n')
+	}
+	at := strings.Index(text, value)
+	return at, at + len(value)
+}
+
+// decodeLiterals joins the decoded string literals of a JSON file.
+func decodeLiterals(data []byte, kind fileKind) string {
+	var sb strings.Builder
+	eachUnit(data, kind, func(unit []byte, _ int) {
+		ok := scanJSON(unit, func(lit literal) {
+			if lit.key != "" {
+				sb.WriteString(lit.key + ": ")
+			}
+			raw := unit[lit.start:lit.end]
+			writeDecoded(&sb, raw, decodeJSONString(raw))
+		})
+		if !ok || !looksLikeJSON(unit) {
+			writeRawUnit(&sb, unit)
+		}
 	})
 	return sb.String()
 }

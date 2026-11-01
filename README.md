@@ -137,11 +137,12 @@ once as `DB_PASSWORD=...` and later on its own in a `psql` command, both go.
 
 ## How it rewrites files
 
-Transcripts are JSON lines, and the same secret can sit in them as is,
-escaped once, or escaped twice when a tool returned JSON. claude-scrub looks
-for all three forms and only cuts where the cut can't break an escape
-sequence. Any line that would stop being valid JSON is left alone and
-reported.
+Transcripts are JSON lines, and the same secret can sit in them as is or
+escaped, once for each level of JSON inside JSON, up to five levels. It also
+recognizes other spellings of a value, like `\u00e4` for `ä` or `\/` for `/`,
+in text files too. It only cuts where the cut can't break an escape sequence.
+A match that would make valid JSON invalid, at any level, stays in the file
+and is reported. A line cut short by a crash only affects itself.
 
 Every other byte stays the same. Each file is written to a temporary file and
 renamed into place, keeping its mode and modification time. If a running
@@ -160,6 +161,9 @@ printed, are cut into windows around each keyword.
 - Detection is best effort. A password that never appears next to a
   secret-looking name is missed unless it's in your secrets file. The same
   goes for derived values, like a base64-encoded `id:key`.
+- In a text file, detection reads the text as is. A value only ever written
+  there with an escape, like `\u00e4`, is missed unless it's in your secrets
+  file or was found elsewhere. Once known, it's redacted in any spelling.
 - `--explain` and `--peek` print text from your history. Everything found is
   redacted in it, but anything the detectors missed shows as is.
 - Redaction is permanent. There is no backup, since a backup would hold the
