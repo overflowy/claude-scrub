@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"slices"
 	"sort"
-	"strings"
-	"sync"
 
 	ahocorasick "github.com/BobuSumisu/aho-corasick"
 )
@@ -52,7 +50,7 @@ func (r *replacer) placeholder(secret int) string {
 type hit struct {
 	start, end int
 	secret     int
-	joined     []int // other secrets whose tails this hit was extended over
+	joined     []int // other secrets inside this hit
 }
 
 // shift returns h with its offsets moved back by n.
@@ -72,13 +70,7 @@ func countHits(counts map[int]int, hits []hit) {
 	}
 }
 
-// find returns the non-overlapping occurrences in b, leftmost first and the
-// longest at each position.
-func (r *replacer) find(b []byte) []hit {
-	return mergeHits(r.matches(b, nil))
-}
-
-// matches is find before overlapping occurrences are joined. An occurrence right
+// matches returns the occurrences in b, which can overlap. An occurrence right
 // after an odd run of backslashes is skipped where isJSON says b is JSON: its
 // first character belongs to an escape sequence, so cutting there would corrupt
 // the string.
@@ -98,8 +90,9 @@ func (r *replacer) matches(b []byte, isJSON func(at int) bool) []hit {
 	return hits
 }
 
-// mergeHits sorts hits and joins the overlapping ones, leftmost first. Dropping
-// the second of two that overlap would leave its tail in the file.
+// mergeHits sorts hits in place and returns them with the overlapping ones joined,
+// leftmost first. Dropping the second of two that overlap would leave its tail in
+// the file. Taking a joined hit apart again needs the sorted hits it came from.
 func mergeHits(hits []hit) []hit {
 	sort.Slice(hits, func(i, j int) bool {
 		if hits[i].start != hits[j].start {
@@ -107,31 +100,25 @@ func mergeHits(hits []hit) []hit {
 		}
 		return hits[i].end > hits[j].end
 	})
-	out := hits[:0]
+	var out []hit
 	for _, h := range hits {
 		if len(out) == 0 || h.start >= out[len(out)-1].end {
 			out = append(out, h)
 			continue
 		}
 		last := &out[len(out)-1]
-		if h.end > last.end {
-			last.end = h.end
-			for _, s := range append([]int{h.secret}, h.joined...) {
-				if s != last.secret && !slices.Contains(last.joined, s) {
-					last.joined = append(last.joined, s)
-				}
+		last.end = max(last.end, h.end)
+		for _, s := range append([]int{h.secret}, h.joined...) {
+			if s != last.secret && !slices.Contains(last.joined, s) {
+				last.joined = append(last.joined, s)
 			}
 		}
 	}
 	return out
 }
 
-// findAll returns every occurrence in data, however it is spelled.
-func (r *replacer) findAll(data []byte, kind fileKind) []hit {
-	return mergeHits(r.occurrences(data, kind))
-}
-
-// occurrences is findAll before overlapping occurrences are joined.
+// occurrences returns every occurrence in data, however it is spelled, which can
+// overlap. kind has to come from checkKind.
 func (r *replacer) occurrences(data []byte, kind fileKind) []hit {
 	var isJSON func(int) bool
 	if kind != kindText {
@@ -144,14 +131,13 @@ func (r *replacer) occurrences(data []byte, kind fileKind) []hit {
 // only asked about the rare match after a backslash, so it parses on demand and
 // remembers the last line it saw.
 func jsonAt(data []byte, kind fileKind) func(at int) bool {
-	validDoc := sync.OnceValue(func() bool { return kind == kindJSONDoc && json.Valid(data) })
+	if kind == kindJSONDoc {
+		return func(int) bool { return true }
+	}
 	lastLine, lastValid := -1, false
 	return func(at int) bool {
-		if validDoc() {
-			return true
-		}
-		if ls := lineStartAt(data, at); ls != lastLine {
-			lastLine, lastValid = ls, json.Valid(data[ls:lineEndAt(data, at)])
+		if ls := lineStart(data, at); ls != lastLine {
+			lastLine, lastValid = ls, json.Valid(data[ls:lineEnd(data, at)])
 		}
 		return lastValid
 	}
@@ -172,16 +158,13 @@ func (r *replacer) findDecoded(data []byte, kind fileKind) []hit {
 		if !hasOtherEscape(u.data) {
 			return
 		}
-		if kind == kindText {
+		if kind == kindText || !u.isValid() {
 			hits = append(hits, r.findInBody(u.data, u.base)...)
 			return
 		}
-		whole := u.literals(func(lit literal) {
+		scanJSON(u.data, func(lit literal) {
 			hits = append(hits, r.findInBody(u.data[lit.start+1:lit.end-1], u.base+lit.start+1)...)
 		})
-		if !whole {
-			hits = append(hits, r.findInBody(u.data, u.base)...)
-		}
 	})
 	return hits
 }
@@ -206,7 +189,7 @@ func (r *replacer) findInBody(body []byte, base int) []hit {
 			}
 		}
 		text, toBody = next, offs
-		for _, h := range r.find(text) {
+		for _, h := range r.matches(text, nil) {
 			h.start, h.end = base+toBody[h.start], base+toBody[h.end]
 			hits = append(hits, h)
 		}
@@ -307,28 +290,6 @@ func literalBodies(data []byte) [][]byte {
 	return bodies
 }
 
-// snippet returns the part of text within around bytes of [start, end) with
-// every secret redacted; hits are those findAll returned for text. The window is
-// widened over any secret it would cut, as a fragment would match nothing.
-func (r *replacer) snippet(text string, hits []hit, start, end, around int) string {
-	lo, hi := max(0, start-around), min(len(text), end+around)
-	for _, h := range hits {
-		if h.start < lo && lo < h.end {
-			lo = h.start
-		}
-		if h.start < hi && hi < h.end {
-			hi = h.end
-		}
-	}
-	var inside []hit
-	for _, h := range hits {
-		if h.start >= lo && h.end <= hi {
-			inside = append(inside, h.shift(lo))
-		}
-	}
-	return strings.ToValidUTF8(string(r.apply([]byte(text[lo:hi]), inside, map[int]int{})), "")
-}
-
 // hasOtherEscape reports whether b holds an escape jsonEscape would not write,
 // or one that a further decode could turn into one.
 func hasOtherEscape(b []byte) bool {
@@ -349,8 +310,22 @@ type fileKind int
 const (
 	kindText      fileKind = iota
 	kindJSONLines          // one JSON document per line
-	kindJSONDoc            // a single JSON document
+	kindJSONDoc            // a single JSON document, valid once through checkKind
 )
+
+// checkKind settles kind now that data is at hand: JSON that holds together as one
+// document is one, whatever the file is called, and anything else goes line by
+// line. Lines of JSON fail this right after the first of them, so it costs little,
+// and this one parse answers it for everything after.
+func checkKind(data []byte, kind fileKind) fileKind {
+	switch {
+	case kind == kindText:
+		return kindText
+	case isStructuredJSON(data):
+		return kindJSONDoc
+	}
+	return kindJSONLines
+}
 
 type redaction struct {
 	out    []byte
@@ -364,18 +339,19 @@ type redaction struct {
 // redact replaces every occurrence of a secret in data with its placeholder.
 func (r *replacer) redact(data []byte, kind fileKind) redaction {
 	res := redaction{counts: map[int]int{}, left: map[int]int{}}
+	kind = checkKind(data, kind)
 	hits := r.occurrences(data, kind)
 	if len(hits) == 0 {
 		res.out = data
 		return res
 	}
 
-	switch {
-	case kind == kindText:
+	switch kind {
+	case kindText:
 		res.out = r.apply(data, mergeHits(hits), res.counts)
-	case kind == kindJSONDoc && isStructuredJSON(data):
+	case kindJSONDoc:
 		var anyLeft bool
-		res.out, anyLeft = r.redactUnit(data, true, mergeHits(hits), res.counts, res.left)
+		res.out, anyLeft = r.redactUnit(data, 0, true, mergeHits(hits), hits, &res)
 		if anyLeft {
 			res.skipped = 1
 		}
@@ -386,34 +362,38 @@ func (r *replacer) redact(data []byte, kind fileKind) redaction {
 }
 
 // redactLines redacts data line by line, for JSON lines and for a document too
-// broken to treat as one. A hit across lines joins them, so it goes only if none
-// of them is valid JSON. It is taken out before hits are merged, so that what
-// overlaps it on one line still goes.
+// broken to treat as one. A hit across lines joins them, so it stays if it starts
+// or ends on valid JSON, and goes around any such lines in between. It is taken
+// out before hits are merged, so that what overlaps it on one line still goes.
 func (r *replacer) redactLines(data []byte, occurrences []hit, res *redaction) {
-	var hits []hit
+	var single []hit
 	leftLines := map[int]bool{}
 	for _, h := range occurrences {
 		if bytes.IndexByte(data[h.start:h.end], '\n') >= 0 && touchesJSONLine(data, h) {
+			if parts := aroundJSONLines(data, h); parts != nil {
+				single = append(single, parts...)
+				continue
+			}
 			countHits(res.left, []hit{h})
-			leftLines[lineStartAt(data, h.start)] = true
+			leftLines[lineStart(data, h.start)] = true
 			continue
 		}
-		hits = append(hits, h)
+		single = append(single, h)
 	}
-	hits = mergeHits(hits)
+	hits := mergeHits(single)
 
 	var buf bytes.Buffer
 	buf.Grow(len(data))
-	lineStart := 0
+	copied := 0
 	for len(hits) > 0 {
 		// The line holding the next hit, and those a hit runs on to
-		ls := lineStart + bytes.LastIndexByte(data[lineStart:hits[0].start], '\n') + 1
-		le := lineEndAt(data, hits[0].start)
+		ls := copied + bytes.LastIndexByte(data[copied:hits[0].start], '\n') + 1
+		le := lineEnd(data, hits[0].start)
 		n := 0
 		// A hit can start on the newline itself, ending this line
 		for n < len(hits) && hits[n].start <= le {
 			if hits[n].end > le {
-				le = lineEndAt(data, hits[n].end)
+				le = lineEnd(data, hits[n].end)
 			}
 			n++
 		}
@@ -423,36 +403,23 @@ func (r *replacer) redactLines(data []byte, occurrences []hit, res *redaction) {
 		}
 		hits = hits[n:]
 
-		newLine, anyLeft := r.redactUnit(data[ls:le], isStructuredJSON(data[ls:le]), lineHits, res.counts, res.left)
-		buf.Write(data[lineStart:ls])
+		newLine, anyLeft := r.redactUnit(data[ls:le], ls, isStructuredJSON(data[ls:le]), lineHits, single, res)
+		buf.Write(data[copied:ls])
 		buf.Write(newLine)
 		if anyLeft {
 			leftLines[ls] = true
 		}
-		lineStart = le
+		copied = le
 	}
-	buf.Write(data[lineStart:])
+	buf.Write(data[copied:])
 	res.out = buf.Bytes()
 	res.skipped = len(leftLines)
-}
-
-// lineStartAt returns the offset just past the last newline before i, or 0.
-func lineStartAt(data []byte, i int) int {
-	return bytes.LastIndexByte(data[:i], '\n') + 1
-}
-
-// lineEndAt returns the offset of the first newline at or after i, or len(data).
-func lineEndAt(data []byte, i int) int {
-	if j := bytes.IndexByte(data[i:], '\n'); j >= 0 {
-		return i + j
-	}
-	return len(data)
 }
 
 // touchesJSONLine reports whether replacing h would change a line of valid JSON.
 // Measured from h.end, this includes the line a final newline would join on.
 func touchesJSONLine(data []byte, h hit) bool {
-	for line := range bytes.SplitSeq(data[lineStartAt(data, h.start):lineEndAt(data, h.end)], []byte{'\n'}) {
+	for line := range bytes.SplitSeq(data[lineStart(data, h.start):lineEnd(data, h.end)], []byte{'\n'}) {
 		if isStructuredJSON(line) {
 			return true
 		}
@@ -460,28 +427,100 @@ func touchesJSONLine(data []byte, h hit) bool {
 	return false
 }
 
-// redactUnit redacts a line or document, and isJSON says whether it is JSON to
-// keep valid. A hit that would break that JSON, or JSON inside a string, stays.
-// It returns the result, and whether anything was left in place.
-func (r *replacer) redactUnit(unit []byte, isJSON bool, hits []hit, counts, left map[int]int) ([]byte, bool) {
+// aroundJSONLines cuts h, which touches a line of valid JSON, into the parts between
+// such lines. It returns nil if h starts or ends on one, as replacing h would then
+// change that line. Measured from h.end like touchesJSONLine.
+func aroundJSONLines(data []byte, h hit) []hit {
+	var parts []hit
+	start := h.start
+	for ls := lineStart(data, h.start); ; {
+		le := lineEnd(data, ls)
+		last := h.end <= le
+		if isStructuredJSON(data[ls:le]) {
+			if ls <= h.start || last {
+				return nil
+			}
+			if start < ls-1 {
+				parts = append(parts, hit{start: start, end: ls - 1, secret: h.secret})
+			}
+			start = le + 1
+		}
+		if last {
+			break
+		}
+		ls = le + 1
+	}
+	if start < h.end {
+		parts = append(parts, hit{start: start, end: h.end, secret: h.secret})
+	}
+	return parts
+}
+
+// redactUnit redacts a line or document at offset base of the file, and isJSON
+// says whether it is JSON to keep valid. A hit that would break that JSON, or JSON
+// inside a string, stays. occurrences are the sorted hits of the file before they
+// were joined. It returns the result, and whether anything was left in place.
+func (r *replacer) redactUnit(unit []byte, base int, isJSON bool, hits, occurrences []hit, res *redaction) ([]byte, bool) {
 	if !isJSON {
-		return r.apply(unit, hits, counts), false
+		return r.apply(unit, hits, res.counts), false
 	}
 	kept, dropped := r.keepNested(unit, hits)
 	out := r.apply(unit, kept, map[int]int{})
-	if !json.Valid(out) {
+	if len(dropped) > 0 || !json.Valid(out) {
 		var bad []hit
 		kept, bad = r.keepValid(unit, kept)
-		dropped = append(dropped, bad...)
+		kept, dropped = r.splitDropped(unit, base, occurrences, kept, append(dropped, bad...))
 		out = r.apply(unit, kept, map[int]int{})
 		// Each fine alone, but not together
 		if !json.Valid(out) {
 			dropped, kept, out = append(dropped, kept...), nil, unit
 		}
 	}
-	countHits(counts, kept)
-	countHits(left, dropped)
+	countHits(res.counts, kept)
+	countHits(res.left, dropped)
 	return out, len(dropped) > 0
+}
+
+// allSafe reports whether every hit can go without breaking unit, a line or
+// document of JSON, or JSON inside one of its strings.
+func (r *replacer) allSafe(unit []byte, hits []hit) bool {
+	kept, dropped := r.keepNested(unit, hits)
+	return len(dropped) == 0 && json.Valid(r.apply(unit, kept, map[int]int{}))
+}
+
+// splitDropped takes apart the dropped hits that joined several secrets, as one
+// that breaks the JSON would otherwise keep the others in the file too. A secret
+// goes if all its occurrences in the hit can, along with those that went before
+// it. Trying by secret keeps this cheap: each try parses the whole unit, and a
+// secret overlapping itself can match at every byte of a long run.
+func (r *replacer) splitDropped(unit []byte, base int, occurrences, kept, dropped []hit) (_, stay []hit) {
+	for _, d := range dropped {
+		if d.joined == nil {
+			stay = append(stay, d)
+			continue
+		}
+		first := sort.Search(len(occurrences), func(i int) bool { return occurrences[i].start >= d.start+base })
+		var safe []hit
+		for _, s := range append([]int{d.secret}, d.joined...) {
+			var own []hit
+			for _, o := range occurrences[first:] {
+				if o.start >= d.end+base {
+					break
+				}
+				if o.secret == s {
+					own = append(own, o.shift(base))
+				}
+			}
+			if try := mergeHits(slices.Concat(safe, own)); r.allSafe(unit, try) {
+				safe = try
+			} else {
+				stay = append(stay, mergeHits(own)...)
+			}
+		}
+		kept = append(kept, safe...)
+	}
+	// Nothing overlaps here, this only puts them back in order
+	return mergeHits(kept), stay
 }
 
 // keepValid splits hits into those that leave unit valid JSON and those that do

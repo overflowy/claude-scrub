@@ -168,12 +168,12 @@ func (f *lineFinder) lines(text string) []keywordLine {
 			}
 			return true
 		}
-		lineStartAt, lineEndAt = lineStart(text, at), lineEnd(text, at)
+		lineStartAt, lineEndAt = lineStart(lower, at), lineEnd(lower, at)
 		if lineEndAt-lineStartAt > maxSpan {
 			addWindow(lineStartAt, lineEndAt, at, int(n), own)
 			return true
 		}
-		ls, le := widen(text, lower, lineStartAt, lineEndAt)
+		ls, le := widen(lower, lineStartAt, lineEndAt)
 		if len(spans) > 0 && ls <= spans[len(spans)-1].end {
 			last := &spans[len(spans)-1]
 			last.end, last.own = max(last.end, le), last.own || own
@@ -202,40 +202,46 @@ const (
 // lines can match from it: a private key block to its end, a curl command
 // over the next 5 lines (curl-auth-user, curl-auth-header), and a Kubernetes
 // Secret 300 bytes either way (kubernetes-secret-yaml).
-func widen(text string, lower []byte, ls, le int) (int, int) {
+func widen(lower []byte, ls, le int) (int, int) {
 	line := lower[ls:le]
-	if b := bytes.Index(line, []byte("-----begin")); b >= 0 {
-		// Key blocks are a few KB; without an end nearby this is not one
-		if e := bytes.Index(lower[ls+b:min(len(lower), ls+b+maxKeyBlock)], []byte("-----end")); e >= 0 {
-			le = max(le, lineEnd(text, ls+b+e))
+	if b := bytes.LastIndex(line, []byte("-----begin")); b >= 0 {
+		// Key blocks are a few KB; without an end nearby this is not one. Nor with
+		// another block starting first: this one was cut short, and running on
+		// would swallow the header of the next.
+		rest := lower[ls+b+1 : min(len(lower), ls+b+maxKeyBlock)]
+		e, next := bytes.Index(rest, []byte("-----end")), bytes.Index(rest, []byte("-----begin"))
+		if e >= 0 && (next < 0 || e < next) {
+			le = max(le, lineEnd(lower, ls+b+1+e))
 		}
 	}
 	if bytes.Contains(line, []byte("curl")) {
 		end := le
 		for range 5 {
-			if end >= len(text) {
+			if end >= len(lower) {
 				break
 			}
-			end = lineEnd(text, end+1)
+			end = lineEnd(lower, end+1)
 		}
 		le = max(le, end)
 	}
 	if bytes.Contains(line, []byte("kind:")) && bytes.Contains(line, []byte("secret")) {
-		ls = lineStart(text, max(0, ls-300))
-		le = max(le, lineEnd(text, min(len(text), le+300)))
+		ls = lineStart(lower, max(0, ls-300))
+		le = max(le, lineEnd(lower, min(len(lower), le+300)))
 	}
 	return ls, le
 }
 
-func lineStart(text string, at int) int {
-	return strings.LastIndexByte(text[:at], '\n') + 1
+// lineStart returns the offset just past the last newline before at, or 0.
+func lineStart(data []byte, at int) int {
+	return bytes.LastIndexByte(data[:at], '\n') + 1
 }
 
-func lineEnd(text string, from int) int {
-	if i := strings.IndexByte(text[from:], '\n'); i >= 0 {
+// lineEnd returns the offset of the first newline at or after from, or len(data).
+func lineEnd(data []byte, from int) int {
+	if i := bytes.IndexByte(data[from:], '\n'); i >= 0 {
 		return from + i
 	}
-	return len(text)
+	return len(data)
 }
 
 // detector runs the rules over lines. It is not safe for concurrent use;

@@ -58,7 +58,7 @@ tasks:
       - task: test
 
   dry-run:
-    desc: 'Report what would be redacted (extra flags after --, e.g. task dry-run -- -v)'
+    desc: 'Report what would be redacted (extra flags after --, e.g. task dry-run -- --json)'
     cmds:
       - go run . --dry-run {{.CLI_ARGS}}
 

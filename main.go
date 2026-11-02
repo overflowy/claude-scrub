@@ -47,8 +47,6 @@ age.
 Examples:
   claude-scrub --dry-run              # report what would be redacted
   claude-scrub                        # redact, after confirming
-  claude-scrub -n -v --peek           # list files and masked values
-  claude-scrub -n --explain token     # show where "token" values sit
   claude-scrub --hook                 # as a SessionEnd hook (JSON on stdin)
 
 Flags:
@@ -72,9 +70,6 @@ type options struct {
 	minAge     time.Duration
 	noGitleaks bool
 	jsonOut    bool
-	peek       bool
-	explain    []string
-	verbose    bool
 	jobs       int
 	hook       bool
 	quiet      bool // no progress or report on stderr
@@ -134,9 +129,6 @@ func parseFlags() (options, []string, error) {
 	fs.BoolVar(&o.noGitleaks, "no-gitleaks", false, "skip the gitleaks rules (faster, finds fewer token formats)")
 	fs.BoolVar(&o.hook, "hook", false, "run as a SessionEnd hook: redact the session on stdin, and history.jsonl")
 	fs.BoolVar(&o.jsonOut, "json", false, "print the report as JSON on stdout")
-	fs.BoolVar(&o.peek, "peek", false, "show masked values (first and last 2 characters) in the report")
-	fs.StringArrayVar(&o.explain, "explain", nil, "show where a label's values were found, redacted (repeatable)")
-	fs.BoolVarP(&o.verbose, "verbose", "v", false, "list every file with redactions")
 	fs.IntVarP(&o.jobs, "jobs", "j", runtime.NumCPU(), "files to process in parallel")
 	fs.BoolVar(&o.version, "version", false, "print the version")
 	fs.Usage = func() {

@@ -118,15 +118,14 @@ func readTarget(path string) ([]byte, fileKind, fs.FileInfo, error) {
 	if bytes.IndexByte(head, 0) >= 0 && !utf8.Valid(data) {
 		return nil, 0, info, nil
 	}
-	// Redaction keeps JSON valid line by line whatever the file holds, so
-	// the first byte is enough to tell
+	// Named as JSON a file stays JSON, even if a crash left junk on its first line;
+	// history.jsonl backups keep the extension in the middle. Anything else goes by
+	// its first byte, as redaction keeps JSON valid line by line whatever the file
+	// holds. checkKind then tells a single document from lines.
 	kind := kindText
-	if looksLikeJSON(data) {
-		kind = kindJSONDoc
-		// history.jsonl backups keep the extension in the middle
-		if strings.Contains(filepath.Base(path), ".jsonl") {
-			kind = kindJSONLines
-		}
+	name := filepath.Base(path)
+	if looksLikeJSON(data) || strings.Contains(name, ".jsonl") || filepath.Ext(name) == ".json" {
+		kind = kindJSONLines
 	}
 	return data, kind, info, nil
 }
@@ -134,14 +133,39 @@ func readTarget(path string) ([]byte, fileKind, fs.FileInfo, error) {
 // keywordLinesIn returns the lines of a file worth running the rules on.
 // JSON is decoded first, and each key/value pair is written as
 // "key": "value" so the name rules see both; pairs are also checked here
-// directly, through add.
+// directly, through add. Lines that are not JSON are written as they are and in
+// order, so a value running across them still matches the file. What can be
+// decoded from them follows each run of such lines, and a blank line ends the
+// run: a line of JSON between two of them holds them apart in the file. The
+// exception is inside a private key block, whose value would include that line.
 func keywordLinesIn(f *lineFinder, data []byte, kind fileKind, add func(candidate)) []keywordLine {
 	if kind == kindText {
 		return f.lines(string(data))
 	}
-	var sb strings.Builder
-	eachUnit(data, kind, func(u unit) {
-		whole := u.literals(func(lit literal) {
+	var sb, decoded strings.Builder
+	inRun := false
+	endRun := func() {
+		if inRun {
+			sb.WriteByte('\n')
+			sb.WriteString(decoded.String())
+			decoded.Reset()
+			inRun = false
+		}
+	}
+	var keys keyCarry
+	blockEnd := 0 // where a key block opened in a run has to have ended
+	eachUnit(data, checkKind(data, kind), func(u unit) {
+		valid, out := u.isValid(), &sb
+		if valid && u.base >= blockEnd {
+			endRun()
+		} else {
+			sb.Write(u.data)
+			sb.WriteByte('\n')
+			inRun = true
+			out = &decoded
+			blockEnd = keyBlockEnd(u.data, u.base, blockEnd)
+		}
+		keys.scan(u.data, func(lit literal) {
 			if lit.isKey {
 				return
 			}
@@ -153,16 +177,34 @@ func keywordLinesIn(f *lineFinder, data []byte, kind fileKind, add func(candidat
 			value := decodeJSONString(raw)
 			if lit.key != "" {
 				scanPair(lit.key, value, add)
-				sb.WriteString(`"` + lit.key + `": "`)
+				out.WriteString(`"` + lit.key + `": "`)
 			}
-			writeDecoded(&sb, raw, value)
+			writeDecoded(out, raw, value)
 		})
-		// An unterminated string, or not JSON after all
-		if !whole {
-			writeRawUnit(&sb, u.data)
+		// A secret can sit outside the strings it could read
+		if !valid && bytes.IndexByte(u.data, '\\') >= 0 {
+			writeDecoded(out, u.data, decodeBody(u.data))
 		}
 	})
+	endRun()
 	return f.lines(sb.String())
+}
+
+// keyBlockEnd returns blockEnd after a line at offset base: past the longest block
+// if the line opens one, or 0 if it closes one.
+func keyBlockEnd(line []byte, base, blockEnd int) int {
+	if !bytes.Contains(line, []byte("-----")) {
+		return blockEnd
+	}
+	lower := bytes.ToLower(line)
+	begin, end := bytes.LastIndex(lower, []byte("-----begin")), bytes.LastIndex(lower, []byte("-----end"))
+	switch {
+	case begin > end:
+		return base + maxKeyBlock
+	case end >= 0:
+		return 0
+	}
+	return blockEnd
 }
 
 var errChanged = errors.New("file changed while it was being redacted")

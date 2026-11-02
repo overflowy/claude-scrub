@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"slices"
 	"strings"
 	"unicode/utf16"
@@ -158,52 +157,32 @@ func writeDecoded(sb *strings.Builder, raw []byte, value string) {
 	}
 }
 
-// writeRawUnit writes a unit that scanJSON cannot fully account for, as is and
-// decoded: it may hold secrets outside any string it could read.
-func writeRawUnit(sb *strings.Builder, unit []byte) {
-	sb.Write(unit)
-	sb.WriteByte('\n')
-	if slices.Contains(unit, '\\') {
-		writeDecoded(sb, unit, decodeBody(unit))
-	}
-}
-
 // unit is a part of a file to parse on its own.
 type unit struct {
 	data  []byte
 	base  int  // offset of data in the file
-	valid bool // known to be valid JSON
-	keys  *keyCarry
+	valid bool // known to be JSON to protect
 }
 
+// isValid reports whether u is JSON to protect, so its strings account for all of
+// it. If not, a secret can sit outside them, or run on to the next line.
 func (u unit) isValid() bool {
-	return u.valid || json.Valid(u.data)
+	return u.valid || isStructuredJSON(u.data)
 }
 
-// literals calls fn for every string in u, and reports whether they account for
-// all of it. If not, a secret can sit outside them.
-func (u unit) literals(fn func(lit literal)) bool {
-	return u.keys.scan(u.data, fn) && u.isValid()
-}
-
-// eachUnit calls fn with each part of data to parse on its own. Strings in valid
-// JSON cannot span lines, so apart from a valid document data goes line by line:
-// a line cut short by a crash then only affects itself, instead of pairing up
-// the quotes of every line after it the wrong way.
+// eachUnit calls fn with each part of data to parse on its own; kind has to come
+// from checkKind. Strings in valid JSON cannot span lines, so apart from a valid
+// document data goes line by line: a line cut short by a crash then only affects
+// itself, instead of pairing up the quotes of every line after it the wrong way.
+// Blank lines are units too, as a value can run across them.
 func eachUnit(data []byte, kind fileKind, fn func(u unit)) {
-	var keys keyCarry
-	if kind == kindJSONDoc && json.Valid(data) {
-		fn(unit{data: data, valid: true, keys: &keys})
+	if kind == kindJSONDoc {
+		fn(unit{data: data, valid: true})
 		return
 	}
 	for start := 0; start < len(data); {
-		end := len(data)
-		if i := bytes.IndexByte(data[start:], '\n'); i >= 0 {
-			end = start + i
-		}
-		if end > start {
-			fn(unit{data: data[start:end], base: start, keys: &keys})
-		}
+		end := lineEnd(data, start)
+		fn(unit{data: data[start:end], base: start})
 		start = end + 1
 	}
 }

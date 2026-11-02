@@ -8,10 +8,8 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"maps"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -161,14 +159,11 @@ func scrub(ctx context.Context, o options, paths []string) error {
 			return err
 		}
 	} else if !o.quiet {
-		printReport(os.Stderr, sum, o)
+		printReport(os.Stderr, sum)
 	}
 	if len(unreadable) > 0 {
 		sort.Strings(unreadable)
 		fmt.Fprintf(os.Stderr, "Could not read %s:\n%s\n", plural(len(unreadable), "file"), strings.Join(unreadable, "\n"))
-	}
-	for _, label := range o.explain {
-		explain(os.Stderr, rep, sum, labelFor(label))
 	}
 
 	if sum.occurrences == 0 {
@@ -304,10 +299,9 @@ func forEach(ctx context.Context, targets []target, jobs int, fn func(worker int
 
 type labelSummary struct {
 	label       string
-	values      []string
+	values      int
 	occurrences int
 	files       map[string]bool
-	leftIn      map[string]bool // files with matches left in place
 }
 
 type fileSummary struct {
@@ -346,16 +340,13 @@ func summarize(secrets []secret, results []fileResult) summary {
 		s.found++
 		l := byLabel[sec.label]
 		if l == nil {
-			l = &labelSummary{label: sec.label, files: map[string]bool{}, leftIn: map[string]bool{}}
+			l = &labelSummary{label: sec.label, files: map[string]bool{}}
 			byLabel[sec.label] = l
 		}
-		l.values = append(l.values, sec.value)
+		l.values++
 	}
 	for _, r := range results {
 		s.skipped += r.skipped
-		for i := range r.left {
-			byLabel[secrets[i].label].leftIn[r.path] = true
-		}
 		if len(r.counts) == 0 {
 			continue
 		}
@@ -383,7 +374,7 @@ func summarize(secrets []secret, results []fileResult) summary {
 	return s
 }
 
-func printReport(w io.Writer, s summary, o options) {
+func printReport(w io.Writer, s summary) {
 	if len(s.labels) == 0 {
 		return
 	}
@@ -393,18 +384,7 @@ func printReport(w io.Writer, s summary, o options) {
 	}
 	fmt.Fprintf(w, "\n%-*s  %6s  %11s  %5s\n", width, "LABEL", "VALUES", "OCCURRENCES", "FILES")
 	for _, l := range s.labels {
-		fmt.Fprintf(w, "%-*s  %6d  %11d  %5d\n", width, l.label, len(l.values), l.occurrences, len(l.files))
-		if o.peek {
-			for _, v := range l.values {
-				fmt.Fprintf(w, "    %s\n", mask(v))
-			}
-		}
-	}
-	if o.verbose && len(s.files) > 0 {
-		fmt.Fprintln(w)
-		for _, f := range s.files {
-			fmt.Fprintf(w, "%5d  %s  (%s)\n", f.occurrences, displayPath(f.path), labelList(f.labels))
-		}
+		fmt.Fprintf(w, "%-*s  %6d  %11d  %5d\n", width, l.label, l.values, l.occurrences, len(l.files))
 	}
 	if s.skipped > 0 {
 		fmt.Fprintf(w, "\nLeft matches in %s: redacting them would have broken the JSON.\n", plural(s.skipped, "JSON line"))
@@ -413,11 +393,10 @@ func printReport(w io.Writer, s summary, o options) {
 
 func printJSON(w io.Writer, s summary, o options, scanned int) error {
 	type jsonLabel struct {
-		Label       string   `json:"label"`
-		Values      int      `json:"values"`
-		Masked      []string `json:"masked,omitempty"`
-		Occurrences int      `json:"occurrences"`
-		Files       int      `json:"files"`
+		Label       string `json:"label"`
+		Values      int    `json:"values"`
+		Occurrences int    `json:"occurrences"`
+		Files       int    `json:"files"`
 	}
 	type jsonFile struct {
 		Path        string         `json:"path"`
@@ -434,13 +413,7 @@ func printJSON(w io.Writer, s summary, o options, scanned int) error {
 		Files        []jsonFile  `json:"files"`
 	}{DryRun: o.dryRun, FilesScanned: scanned, Occurrences: s.occurrences, SkippedLines: s.skipped}
 	for _, l := range s.labels {
-		jl := jsonLabel{Label: l.label, Values: len(l.values), Occurrences: l.occurrences, Files: len(l.files)}
-		if o.peek {
-			for _, v := range l.values {
-				jl.Masked = append(jl.Masked, mask(v))
-			}
-		}
-		out.Labels = append(out.Labels, jl)
+		out.Labels = append(out.Labels, jsonLabel{Label: l.label, Values: l.values, Occurrences: l.occurrences, Files: len(l.files)})
 	}
 	for _, f := range s.files {
 		out.Files = append(out.Files, jsonFile{Path: f.path, Occurrences: f.occurrences, Labels: f.labels, Skipped: f.skipped})
@@ -448,127 +421,6 @@ func printJSON(w io.Writer, s summary, o options, scanned int) error {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(out)
-}
-
-// explain prints, for each value of label, the text around its first
-// occurrence with every secret in it redacted.
-func explain(w io.Writer, rep *replacer, s summary, label string) {
-	fmt.Fprintf(w, "\n%s:\n", label)
-	found := false
-	for _, l := range s.labels {
-		if l.label != label {
-			continue
-		}
-		found = true
-		for i, snippet := range firstSnippets(rep, l) {
-			if snippet == "" {
-				snippet = "(no occurrence)"
-			}
-			fmt.Fprintf(w, "  %d. %s\n", i+1, snippet)
-		}
-	}
-	if !found {
-		fmt.Fprintln(w, "  no values found")
-	}
-}
-
-// firstSnippets returns the text around the first occurrence of each of l's
-// values, or "" if it has none. A label can have many values in the same few
-// files, so it goes through the files rather than the values: each is read once,
-// and only one is in memory at a time.
-func firstSnippets(rep *replacer, l *labelSummary) []string {
-	const around = 80
-	snippets := make([]string, len(l.values))
-	missing := len(l.values)
-	fill := func(path, text string, hits []hit) {
-		for i, v := range l.values {
-			if snippets[i] != "" {
-				continue
-			}
-			start, end := locate(rep, text, hits, v)
-			if start < 0 {
-				continue
-			}
-			shown := rep.snippet(text, hits, start, end, around)
-			snippets[i] = fmt.Sprintf("%s\n      %s", displayPath(path), strings.Join(strings.Fields(shown), " "))
-			missing--
-		}
-	}
-	paths := maps.Clone(l.files)
-	maps.Copy(paths, l.leftIn)
-	for _, path := range slices.Sorted(maps.Keys(paths)) {
-		if missing == 0 {
-			break
-		}
-		data, kind, _, err := readTarget(path)
-		if err != nil || data == nil {
-			continue
-		}
-		text := string(data)
-		if kind != kindText {
-			text = decodeLiterals(data, kind)
-		}
-		fill(path, text, rep.findAll([]byte(text), kindText))
-		// A match left in place can sit outside the strings, or cross them
-		if missing > 0 && kind != kindText && l.leftIn[path] {
-			fill(path, string(data), rep.findAll(data, kindText))
-		}
-	}
-	return snippets
-}
-
-// locate returns where value first occurs in text: its hit or one it was joined
-// to, which covers any spelling, or if a longer secret swallowed that hit, the
-// plain value.
-func locate(rep *replacer, text string, hits []hit, value string) (start, end int) {
-	isValue := func(s int) bool { return rep.secrets[s].value == value }
-	for _, h := range hits {
-		if isValue(h.secret) || slices.ContainsFunc(h.joined, isValue) {
-			return h.start, h.end
-		}
-	}
-	at := strings.Index(text, value)
-	return at, at + len(value)
-}
-
-// decodeLiterals joins the decoded string literals of a JSON file. Lines that are
-// not valid JSON stay as they are and in order: a secret can sit outside their
-// strings, or run on to the next line, and has to match to be redacted.
-func decodeLiterals(data []byte, kind fileKind) string {
-	var sb strings.Builder
-	eachUnit(data, kind, func(u unit) {
-		if !u.isValid() {
-			sb.Write(u.data)
-			sb.WriteByte('\n')
-			return
-		}
-		u.keys.scan(u.data, func(lit literal) {
-			if lit.key != "" {
-				sb.WriteString(lit.key + ": ")
-			}
-			raw := u.data[lit.start:lit.end]
-			writeDecoded(&sb, raw, decodeJSONString(raw))
-		})
-	})
-	return sb.String()
-}
-
-// mask shows a value's first and last two characters and its length.
-func mask(v string) string {
-	r := []rune(v)
-	if len(r) < 12 {
-		return fmt.Sprintf("%s… (%d chars)", string(r[:1]), len(r))
-	}
-	return fmt.Sprintf("%s…%s (%d chars)", string(r[:2]), string(r[len(r)-2:]), len(r))
-}
-
-func labelList(labels map[string]int) string {
-	var parts []string
-	for l, n := range labels {
-		parts = append(parts, fmt.Sprintf("%s×%d", l, n))
-	}
-	sort.Strings(parts)
-	return strings.Join(parts, ", ")
 }
 
 func displayPath(p string) string {

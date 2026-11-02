@@ -70,13 +70,6 @@ occurrences it found, and changes nothing.
 claude-scrub --dry-run
 ```
 
-To see why something was flagged, ask for the text around each value of a
-label. The snippet is redacted too.
-
-```sh
-claude-scrub -n --explain token
-```
-
 When the report looks right, run it for real. It asks before writing.
 
 ```sh
@@ -142,7 +135,8 @@ escaped, once for each level of JSON inside JSON, up to five levels. It also
 recognizes other spellings of a value, like `\u00e4` for `ä` or `\/` for `/`,
 in text files too. It only cuts where the cut can't break an escape sequence.
 A match that would make valid JSON invalid, at any level, stays in the file
-and is reported. A line cut short by a crash only affects itself.
+and is reported. One that runs across whole lines of valid JSON goes around
+them. A line cut short by a crash only affects itself.
 
 Every other byte stays the same. Each file is written to a temporary file and
 renamed into place, keeping its mode and modification time. If a running
@@ -167,7 +161,5 @@ printed, are cut into windows around each keyword.
 - A file that isn't valid JSON is read line by line, so a value broken across
   lines by a raw newline is only recognized up to the newline. The exception is
   private key blocks.
-- `--explain` and `--peek` print text from your history. Everything found is
-  redacted in it, but anything the detectors missed shows as is.
 - Redaction is permanent. There is no backup, since a backup would hold the
   secrets.
