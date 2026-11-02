@@ -140,12 +140,12 @@ func keywordLinesIn(f *lineFinder, data []byte, kind fileKind, add func(candidat
 		return f.lines(string(data))
 	}
 	var sb strings.Builder
-	eachUnit(data, kind, func(unit []byte, _ int) {
-		ok := scanJSON(unit, func(lit literal) {
+	eachUnit(data, kind, func(u unit) {
+		whole := u.literals(func(lit literal) {
 			if lit.isKey {
 				return
 			}
-			raw := unit[lit.start:lit.end]
+			raw := u.data[lit.start:lit.end]
 			// Images and other blobs: long and without whitespace
 			if len(raw) > 32*1024 && !bytes.ContainsAny(raw, " \\") {
 				return
@@ -158,8 +158,8 @@ func keywordLinesIn(f *lineFinder, data []byte, kind fileKind, add func(candidat
 			writeDecoded(&sb, raw, value)
 		})
 		// An unterminated string, or not JSON after all
-		if !ok || !looksLikeJSON(unit) {
-			writeRawUnit(&sb, unit)
+		if !whole {
+			writeRawUnit(&sb, u.data)
 		}
 	})
 	return f.lines(sb.String())

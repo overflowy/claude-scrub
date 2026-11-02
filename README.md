@@ -164,6 +164,9 @@ printed, are cut into windows around each keyword.
 - In a text file, detection reads the text as is. A value only ever written
   there with an escape, like `\u00e4`, is missed unless it's in your secrets
   file or was found elsewhere. Once known, it's redacted in any spelling.
+- A file that isn't valid JSON is read line by line, so a value broken across
+  lines by a raw newline is only recognized up to the newline. The exception is
+  private key blocks.
 - `--explain` and `--peek` print text from your history. Everything found is
   redacted in it, but anything the detectors missed shows as is.
 - Redaction is permanent. There is no backup, since a backup would hold the

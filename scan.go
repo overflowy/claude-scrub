@@ -26,8 +26,38 @@ type literal struct {
 // tell strings apart from structure. It returns false if a string literal is
 // left unterminated, in which case the caller should treat data as raw text.
 func scanJSON(data []byte, fn func(lit literal)) bool {
+	var c keyCarry
+	return c.scan(data, fn)
+}
+
+// keyCarry is what scanning one line leaves for the next. Going line by line, a
+// key can sit on a different line from its value, or even from its colon.
+type keyCarry struct {
+	key     string // a key still waiting for its value
+	waiting bool
+	last    []byte // raw string ending the line, a key if the next starts with a colon
+}
+
+// scan is scanJSON for one line of a file, or all of a valid one.
+func (c *keyCarry) scan(data []byte, fn func(lit literal)) bool {
+	if onlySpace(data) {
+		return true
+	}
 	pendingKey := ""
 	pendingAt := -1 // offset just past the colon following pendingKey
+	if c.waiting {
+		pendingKey, pendingAt = c.key, 0
+	} else if c.last != nil {
+		i := 0
+		for isJSONSpace(data[i]) {
+			i++
+		}
+		if data[i] == ':' {
+			pendingKey, pendingAt = decodeJSONString(c.last), i+1
+		}
+	}
+	*c = keyCarry{}
+	lastStart, lastEnd := -1, -1
 	for i := 0; i < len(data); i++ {
 		if data[i] != '"' {
 			continue
@@ -61,7 +91,13 @@ func scanJSON(data []byte, fn func(lit literal)) bool {
 			pendingKey = decodeJSONString(data[i:end])
 			pendingAt = k + 1
 		}
+		lastStart, lastEnd = i, end
 		i = end - 1
+	}
+	if pendingAt >= 0 && onlySpace(data[pendingAt:]) {
+		c.key, c.waiting = pendingKey, true
+	} else if lastEnd >= 0 && onlySpace(data[lastEnd:]) {
+		c.last = data[lastStart:lastEnd]
 	}
 	return true
 }
@@ -132,13 +168,32 @@ func writeRawUnit(sb *strings.Builder, unit []byte) {
 	}
 }
 
-// eachUnit calls fn with each part of data to parse on its own, and its offset.
-// Strings in valid JSON cannot span lines, so apart from a valid document data
-// goes line by line: a line cut short by a crash then only affects itself,
-// instead of pairing up the quotes of every line after it the wrong way.
-func eachUnit(data []byte, kind fileKind, fn func(unit []byte, base int)) {
+// unit is a part of a file to parse on its own.
+type unit struct {
+	data  []byte
+	base  int  // offset of data in the file
+	valid bool // known to be valid JSON
+	keys  *keyCarry
+}
+
+func (u unit) isValid() bool {
+	return u.valid || json.Valid(u.data)
+}
+
+// literals calls fn for every string in u, and reports whether they account for
+// all of it. If not, a secret can sit outside them.
+func (u unit) literals(fn func(lit literal)) bool {
+	return u.keys.scan(u.data, fn) && u.isValid()
+}
+
+// eachUnit calls fn with each part of data to parse on its own. Strings in valid
+// JSON cannot span lines, so apart from a valid document data goes line by line:
+// a line cut short by a crash then only affects itself, instead of pairing up
+// the quotes of every line after it the wrong way.
+func eachUnit(data []byte, kind fileKind, fn func(u unit)) {
+	var keys keyCarry
 	if kind == kindJSONDoc && json.Valid(data) {
-		fn(data, 0)
+		fn(unit{data: data, valid: true, keys: &keys})
 		return
 	}
 	for start := 0; start < len(data); {
@@ -147,7 +202,7 @@ func eachUnit(data []byte, kind fileKind, fn func(unit []byte, base int)) {
 			end = start + i
 		}
 		if end > start {
-			fn(data[start:end], start)
+			fn(unit{data: data[start:end], base: start, keys: &keys})
 		}
 		start = end + 1
 	}

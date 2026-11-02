@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -305,6 +307,7 @@ type labelSummary struct {
 	values      []string
 	occurrences int
 	files       map[string]bool
+	leftIn      map[string]bool // files with matches left in place
 }
 
 type fileSummary struct {
@@ -343,13 +346,16 @@ func summarize(secrets []secret, results []fileResult) summary {
 		s.found++
 		l := byLabel[sec.label]
 		if l == nil {
-			l = &labelSummary{label: sec.label, files: map[string]bool{}}
+			l = &labelSummary{label: sec.label, files: map[string]bool{}, leftIn: map[string]bool{}}
 			byLabel[sec.label] = l
 		}
 		l.values = append(l.values, sec.value)
 	}
 	for _, r := range results {
 		s.skipped += r.skipped
+		for i := range r.left {
+			byLabel[secrets[i].label].leftIn[r.path] = true
+		}
 		if len(r.counts) == 0 {
 			continue
 		}
@@ -447,28 +453,6 @@ func printJSON(w io.Writer, s summary, o options, scanned int) error {
 // explain prints, for each value of label, the text around its first
 // occurrence with every secret in it redacted.
 func explain(w io.Writer, rep *replacer, s summary, label string) {
-	const around = 80
-	type explainText struct {
-		text string
-		hits []hit
-	}
-	// A label can have many values in the same few files
-	texts := map[string]*explainText{}
-	load := func(path string) *explainText {
-		if t, ok := texts[path]; ok {
-			return t
-		}
-		var t *explainText
-		if data, kind, _, err := readTarget(path); err == nil && data != nil {
-			text := string(data)
-			if kind != kindText {
-				text = decodeLiterals(data, kind)
-			}
-			t = &explainText{text: text, hits: rep.findAll([]byte(text), kindText)}
-		}
-		texts[path] = t
-		return t
-	}
 	fmt.Fprintf(w, "\n%s:\n", label)
 	found := false
 	for _, l := range s.labels {
@@ -476,23 +460,9 @@ func explain(w io.Writer, rep *replacer, s summary, label string) {
 			continue
 		}
 		found = true
-		for i, v := range l.values {
-			snippet := "(no occurrence)"
-			for _, f := range s.files {
-				if f.labels[label] == 0 {
-					continue
-				}
-				t := load(f.path)
-				if t == nil {
-					continue
-				}
-				start, end := locate(rep, t.text, t.hits, v)
-				if start < 0 {
-					continue
-				}
-				shown := rep.snippet(t.text, t.hits, start, end, around)
-				snippet = fmt.Sprintf("%s\n      %s", displayPath(f.path), strings.Join(strings.Fields(shown), " "))
-				break
+		for i, snippet := range firstSnippets(rep, l) {
+			if snippet == "" {
+				snippet = "(no occurrence)"
 			}
 			fmt.Fprintf(w, "  %d. %s\n", i+1, snippet)
 		}
@@ -502,11 +472,58 @@ func explain(w io.Writer, rep *replacer, s summary, label string) {
 	}
 }
 
-// locate returns where value first occurs in text: its hit, which covers any
-// spelling, or if a longer secret swallowed that hit, the plain value.
+// firstSnippets returns the text around the first occurrence of each of l's
+// values, or "" if it has none. A label can have many values in the same few
+// files, so it goes through the files rather than the values: each is read once,
+// and only one is in memory at a time.
+func firstSnippets(rep *replacer, l *labelSummary) []string {
+	const around = 80
+	snippets := make([]string, len(l.values))
+	missing := len(l.values)
+	fill := func(path, text string, hits []hit) {
+		for i, v := range l.values {
+			if snippets[i] != "" {
+				continue
+			}
+			start, end := locate(rep, text, hits, v)
+			if start < 0 {
+				continue
+			}
+			shown := rep.snippet(text, hits, start, end, around)
+			snippets[i] = fmt.Sprintf("%s\n      %s", displayPath(path), strings.Join(strings.Fields(shown), " "))
+			missing--
+		}
+	}
+	paths := maps.Clone(l.files)
+	maps.Copy(paths, l.leftIn)
+	for _, path := range slices.Sorted(maps.Keys(paths)) {
+		if missing == 0 {
+			break
+		}
+		data, kind, _, err := readTarget(path)
+		if err != nil || data == nil {
+			continue
+		}
+		text := string(data)
+		if kind != kindText {
+			text = decodeLiterals(data, kind)
+		}
+		fill(path, text, rep.findAll([]byte(text), kindText))
+		// A match left in place can sit outside the strings, or cross them
+		if missing > 0 && kind != kindText && l.leftIn[path] {
+			fill(path, string(data), rep.findAll(data, kindText))
+		}
+	}
+	return snippets
+}
+
+// locate returns where value first occurs in text: its hit or one it was joined
+// to, which covers any spelling, or if a longer secret swallowed that hit, the
+// plain value.
 func locate(rep *replacer, text string, hits []hit, value string) (start, end int) {
+	isValue := func(s int) bool { return rep.secrets[s].value == value }
 	for _, h := range hits {
-		if rep.secrets[h.secret].value == value {
+		if isValue(h.secret) || slices.ContainsFunc(h.joined, isValue) {
 			return h.start, h.end
 		}
 	}
@@ -514,20 +531,24 @@ func locate(rep *replacer, text string, hits []hit, value string) (start, end in
 	return at, at + len(value)
 }
 
-// decodeLiterals joins the decoded string literals of a JSON file.
+// decodeLiterals joins the decoded string literals of a JSON file. Lines that are
+// not valid JSON stay as they are and in order: a secret can sit outside their
+// strings, or run on to the next line, and has to match to be redacted.
 func decodeLiterals(data []byte, kind fileKind) string {
 	var sb strings.Builder
-	eachUnit(data, kind, func(unit []byte, _ int) {
-		ok := scanJSON(unit, func(lit literal) {
+	eachUnit(data, kind, func(u unit) {
+		if !u.isValid() {
+			sb.Write(u.data)
+			sb.WriteByte('\n')
+			return
+		}
+		u.keys.scan(u.data, func(lit literal) {
 			if lit.key != "" {
 				sb.WriteString(lit.key + ": ")
 			}
-			raw := unit[lit.start:lit.end]
+			raw := u.data[lit.start:lit.end]
 			writeDecoded(&sb, raw, decodeJSONString(raw))
 		})
-		if !ok || !looksLikeJSON(unit) {
-			writeRawUnit(&sb, unit)
-		}
 	})
 	return sb.String()
 }
