@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"regexp"
 	"slices"
 	"strings"
@@ -49,7 +50,7 @@ var (
 		"([^\\s\"'“”‘’\\\\`<>(){}\\[\\],;&]{8,})")
 
 	// scheme://user:password@host
-	urlCredsRe = regexp.MustCompile(`\b[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:/@"'\\]*:([^\s@/"'\\]{6,})@`)
+	urlCredsRe = regexp.MustCompile(`\b([a-zA-Z][a-zA-Z0-9+.\-]*)://([^\s:/@"'\\]*):([^\s@/"'\\]{6,})@`)
 
 	// Authorization: Bearer xxx / Basic xxx
 	authHeaderRe = regexp.MustCompile(`(?i)\b(bearer|basic)\s+([A-Za-z0-9\-_.~+/]{16,}=*)`)
@@ -66,6 +67,24 @@ var (
 	identPartRe  = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*$`)
 	camelBoundRe = regexp.MustCompile(`([a-z0-9])([A-Z])`)
 	nonLabelRe   = regexp.MustCompile(`[^a-z0-9]+`)
+
+	// A reference to a value rather than the value itself. A password can start
+	// with any of these characters too, so each form is kept narrow.
+	referenceRe = regexp.MustCompile(strings.Join([]string{
+		`^[!@#%][A-Za-z_$][A-Za-z_$./\-]*[0-9]*$`, // !isValid, @scope/pkg, #section: words, not noise
+		`^#[0-9a-fA-F]{8}$`,                       // #rrggbbaa
+		`^#!`,                                     // a shebang
+		`^[%#@]\{`,                                // %{name}, #{name}
+		`^%\w+%`,                                  // %APPDATA%
+		`^%[-+#0-9.]*[a-zA-Z](?:[^A-Za-z0-9]|$)`,  // %s, %-5d, %Y-%m-%d
+		`^\$[A-Za-z_]\w*(?:[/.:\-@]|$)`,           // $VAR, $HOME/.token
+		`\$[A-Z_][A-Z0-9_]{2,}(?:[^A-Za-z0-9_]|$)`, // prefix-$VAR
+	}, "|"))
+	base64Re = regexp.MustCompile(`^[A-Za-z0-9+/]+={0,2}$`)
+	// A letters-only value in a URL, or one with separators
+	urlWordRe = regexp.MustCompile(`^[A-Za-z_\-]+$`)
+	// The name and value in what kubernetes-secret-yaml captures
+	kubernetesDataRe = regexp.MustCompile(`^[\w.-]+:(?:[ \t]*(?:\||>[-+]?)\s+)?[ \t]*["']?([A-Za-z0-9+/]+={0,3})["']?$`)
 
 	stemTrie = ahocorasick.NewTrieBuilder().AddStrings(secretStems).Build()
 )
@@ -247,7 +266,8 @@ func lineEnd(data []byte, from int) int {
 // detector runs the rules over lines. It is not safe for concurrent use;
 // create one per goroutine.
 type detector struct {
-	gl *detect.Detector // nil when gitleaks is disabled
+	gl    *detect.Detector // nil when gitleaks is disabled
+	gated map[string]bool  // rules that gitleaks only runs on certain file names
 }
 
 func newDetector(useGitleaks bool) (*detector, error) {
@@ -261,7 +281,18 @@ func newDetector(useGitleaks bool) (*detector, error) {
 	// Decoded base64 or hex secrets never appear verbatim in the file, so
 	// they could not be redacted anyway
 	gl.MaxDecodeDepth = 0
-	return &detector{gl: gl}, nil
+	// A transcript holds YAML or Terraform under its own name, so a rule asking
+	// for a file name would never fire on it. They run on everything, and
+	// scanGitleaks makes up for what the file name told them.
+	gated := map[string]bool{}
+	for id, r := range gl.Config.Rules {
+		if r.Regex != nil && r.Path != nil {
+			r.Path = nil
+			gl.Config.Rules[id] = r
+			gated[id] = true
+		}
+	}
+	return &detector{gl: gl, gated: gated}, nil
 }
 
 // scanLines runs the rules over each line. Line by line, gitleaks only tries
@@ -286,8 +317,8 @@ func scanLine(line keywordLine, add func(candidate)) {
 	scanAssignments(line, add)
 	if strings.Contains(line.lower, "://") {
 		for _, m := range urlCredsRe.FindAllStringSubmatch(line.text, -1) {
-			if plausibleSecret(m[1]) {
-				add(candidate{value: m[1], label: "url_password", prio: prioPattern})
+			if plausibleURLPassword(m[3], m[1], m[2]) {
+				add(candidate{value: m[3], label: "url_password", prio: prioPattern})
 			}
 		}
 	}
@@ -335,8 +366,9 @@ func scanAssignments(line keywordLine, add func(candidate)) {
 		}
 		vs, ve := e+m[2], e+m[3]
 		value := strings.TrimRight(text[vs:ve], ".")
-		// A function call: the value class stops at the parenthesis
-		if called := ve < len(text) && text[ve] == '('; !called && plausibleSecret(value) {
+		// A function call or ${...}: the value class stops at the bracket
+		called := ve < len(text) && (text[ve] == '(' || text[ve] == '{' && text[ve-1] == '$')
+		if !called && plausibleSecret(value) {
 			add(candidate{value: value, label: labelFor(name), prio: prioName})
 		}
 		return true
@@ -377,6 +409,20 @@ func isNameByte(c byte) bool {
 func (d *detector) scanGitleaks(text string, add func(candidate)) {
 	for _, f := range d.gl.DetectString(text) {
 		value := f.Secret
+		if f.RuleID == "kubernetes-secret-yaml" {
+			if value = kubernetesDataValue(value); value != "" {
+				add(candidate{value: value, label: labelFor(f.RuleID), prio: prioGitleaks})
+			}
+			continue
+		}
+		if d.gated[f.RuleID] {
+			// Without the file name these fire on any password = "..." in any
+			// language, and on defaults the name rules would turn down
+			if value = strings.Trim(value, `"`); plausibleSecret(value) {
+				add(candidate{value: value, label: labelFor(f.RuleID), prio: prioGitleaks})
+			}
+			continue
+		}
 		if f.RuleID == "generic-api-key" {
 			// The generic rule also fires on code (compileToken = t.x); hold
 			// it to the same bar as the name rule
@@ -404,16 +450,33 @@ func scanPair(key, value string, add func(candidate)) {
 	}
 }
 
+// kubernetesDataValue returns the value in what kubernetes-secret-yaml captures,
+// name: value, so it is redacted wherever it appears, or "" if it is not one. The
+// field holds base64 in a real Secret, and that is what tells it from other YAML.
+func kubernetesDataValue(match string) string {
+	m := kubernetesDataRe.FindStringSubmatch(match)
+	if m == nil || !plausibleKnownSecret(m[1]) {
+		return ""
+	}
+	if _, err := base64.StdEncoding.DecodeString(m[1]); err != nil {
+		return ""
+	}
+	return m[1]
+}
+
 // plausibleSecret filters values found next to a secret-looking name: long
 // enough, varied enough, and not a path, URL, date, placeholder or code.
 func plausibleSecret(v string) bool {
 	if !plausibleKnownSecret(v) || len(v) > 512 {
 		return false
 	}
-	for _, p := range []string{"/", "~/", "./", "%", "{", "@", "#"} {
+	for _, p := range []string{"~/", "./", "{"} {
 		if strings.HasPrefix(v, p) {
 			return false
 		}
+	}
+	if strings.HasPrefix(v, "/") && !isBase64Noise(v) {
+		return false
 	}
 	if strings.Contains(v, "://") || dateLikeRe.MatchString(v) || isDottedIdent(v) || looksLikeCode(v) {
 		return false
@@ -422,19 +485,69 @@ func plausibleSecret(v string) bool {
 	return c >= 3 || (c == 2 && len(v) >= 20 && hasDigit(v))
 }
 
-// looksLikeCode reports whether v is an expression rather than a value:
-// minified JS (!x, a&&b, x?.y), shell ($VAR, $(cmd)) or a path in code
-// (Foo::bar).
-func looksLikeCode(v string) bool {
-	if strings.HasPrefix(v, "!") || memberRe.MatchString(v) {
+// plausibleURLPassword filters the password in a URL. Its place marks it as one, so
+// it needs no mix of characters. It still gets redacted everywhere it appears, which
+// plain words rule out: postgres://postgres:postgres@db and
+// mysql://root:MYSQL_PASSWORD@db would take those words out of every transcript.
+func plausibleURLPassword(v, scheme, user string) bool {
+	if !plausibleKnownSecret(v) || len(v) > 512 || strings.EqualFold(v, scheme) || strings.EqualFold(v, user) {
+		return false
+	}
+	if strings.HasPrefix(v, "{") || strings.HasPrefix(v, "[") || looksLikeCode(v) {
+		return false
+	}
+	if !urlWordRe.MatchString(v) {
 		return true
 	}
-	for _, op := range []string{"(", "$", "&&", "||", "=>", "==", "!=", "?.", "::"} {
+	return len(v) >= 12 && !(strings.ContainsAny(v, "_-") && hasStem(v))
+}
+
+// isBase64Noise reports whether v, which starts with a slash, is base64 rather
+// than a path; about 1 base64 key in 64 starts this way. Random text changes
+// between lowercase, uppercase and digits at nearly two thirds of its characters,
+// and a path at far fewer, even one holding a generated name.
+func isBase64Noise(v string) bool {
+	if len(v) < 16 || !base64Re.MatchString(v) {
+		return false
+	}
+	class := func(c byte) byte {
+		switch {
+		case 'a' <= c && c <= 'z':
+			return 'a'
+		case 'A' <= c && c <= 'Z':
+			return 'A'
+		case '0' <= c && c <= '9':
+			return '0'
+		}
+		return 0
+	}
+	pairs, changes := 0, 0
+	for i := 1; i < len(v); i++ {
+		a, b := class(v[i-1]), class(v[i])
+		if a == 0 || b == 0 {
+			continue
+		}
+		pairs++
+		if a != b {
+			changes++
+		}
+	}
+	return changes*5 >= pairs*2
+}
+
+// looksLikeCode reports whether v is an expression rather than a value: minified
+// JS (!x, a&&b, x?.y), a reference to a value ($VAR, $(cmd), %s) or a path in code
+// (Foo::bar).
+func looksLikeCode(v string) bool {
+	if memberRe.MatchString(strings.TrimPrefix(v, "!")) || referenceRe.MatchString(v) {
+		return true
+	}
+	for _, op := range []string{"(", "${", "&&", "||", "?.", "::"} {
 		if strings.Contains(v, op) {
 			return true
 		}
 	}
-	// Base64 padding aside, = means an assignment
+	// Base64 padding aside, = means an assignment or a comparison
 	return strings.Contains(strings.TrimRight(v, "="), "=")
 }
 

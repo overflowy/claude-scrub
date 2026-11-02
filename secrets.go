@@ -137,7 +137,7 @@ func loadEnvFile(path string, c *collector) error {
 		if m == nil {
 			return nil
 		}
-		name, value := m[1], unquote(strings.TrimSpace(m[2]))
+		name, value := m[1], envValue(m[2])
 		if secretNameRe.MatchString(name) && len(value) >= 6 && !isPlaceholder(value) {
 			c.add(candidate{value: value, label: labelFor(name), prio: prioKnown})
 		} else if plausibleSecret(value) && charClasses(value) >= 3 {
@@ -145,6 +145,43 @@ func loadEnvFile(path string, c *collector) error {
 		}
 		return nil
 	})
+}
+
+// envValue returns the value in what follows NAME= in an env file, without its
+// quotes or a trailing comment. A # only starts a comment after whitespace, and
+// never inside quotes.
+func envValue(s string) string {
+	s = strings.TrimSpace(s)
+	if s != "" && (s[0] == '"' || s[0] == '\'') {
+		if end := closingQuote(s); end > 0 {
+			rest := strings.TrimSpace(s[end+1:])
+			if rest == "" || rest[0] == '#' {
+				return s[1:end]
+			}
+		}
+		return unquote(s)
+	}
+	for i := range len(s) {
+		if s[i] == '#' && (i == 0 || s[i-1] == ' ' || s[i-1] == '\t') {
+			s = strings.TrimSpace(s[:i])
+			break
+		}
+	}
+	return unquote(s)
+}
+
+// closingQuote returns the offset of the quote closing the one s starts with, or
+// -1. Only double quotes have escapes.
+func closingQuote(s string) int {
+	for i := 1; i < len(s); i++ {
+		switch {
+		case s[i] == s[0]:
+			return i
+		case s[i] == '\\' && s[0] == '"':
+			i++
+		}
+	}
+	return -1
 }
 
 // unquote strips one pair of matching quotes, and a trailing quote left over

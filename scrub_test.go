@@ -1679,3 +1679,197 @@ func TestRedactEndingRightAfterJSONLine(t *testing.T) {
 		t.Errorf("got %q, want %q", red.out, want)
 	}
 }
+
+// Finding values next to a name, whatever characters they start with or hold
+func TestDetectSecretsThatLookLikeCode(t *testing.T) {
+	cases := map[string]string{
+		`Authorization: Basic dXNlcjpwYXNzd29yZDEyMw==`:    "dXNlcjpwYXNzd29yZDEyMw==",
+		`DB_PASSWORD=c3VwZXJzZWNyZXR2YWx1ZTEyMzQ1Ng==`:     "c3VwZXJzZWNyZXR2YWx1ZTEyMzQ1Ng==",
+		`{"password": "c3VwZXJzZWNyZXR2YWx1ZTEyMzQ1Ng=="}`: "c3VwZXJzZWNyZXR2YWx1ZTEyMzQ1Ng==",
+		`DB_PASSWORD=Pa$$w0rd!2024`:                        "Pa$$w0rd!2024",
+		`DB_PASSWORD=Hunter2$Pass`:                         "Hunter2$Pass",
+		`DB_PASSWORD=Hunter2Pass$`:                         "Hunter2Pass$",
+		`password: $2b$12$KIXxPfnK9Lq0vWb2NcD8eO`:          "$2b$12$KIXxPfnK9Lq0vWb2NcD8eO",
+		`SECRET_KEY=/9aZk3LmQ1xYtR7vWb2NcD8eFg`:            "/9aZk3LmQ1xYtR7vWb2NcD8eFg",
+		`SECRET_KEY=/9j/4AAQSkZJRgABAQ/x7Gh2KpL+m3Qz==`:    "/9j/4AAQSkZJRgABAQ/x7Gh2KpL+m3Qz==",
+		`API_TOKEN=!Zk3LmQ1xYtR7`:                          "!Zk3LmQ1xYtR7",
+		`API_TOKEN=@Zk3LmQ1xYtR7`:                          "@Zk3LmQ1xYtR7",
+		`API_TOKEN=#Zk3LmQ1xYtR7`:                          "#Zk3LmQ1xYtR7",
+		`API_TOKEN=%Zk3LmQ1xYtR7`:                          "%Zk3LmQ1xYtR7",
+	}
+	for text, want := range cases {
+		if got := detectAll(t, text); got[want] == "" {
+			t.Errorf("%s: got %v, want %q", text, got, want)
+		}
+	}
+}
+
+// What those secrets must not be confused with
+func TestDetectIgnoresReferencesAndPaths(t *testing.T) {
+	for _, text := range []string{
+		`token=a==Bcdefgh1`,
+		`token == Bcdefgh12`,
+		`password=$DB_PASSWORD`,
+		`password=$dbPassword1`,
+		`"token": "$API_TOKEN_1"`,
+		`"token": "${API_TOKEN_1}"`,
+		`"token": "prefix-${Token1}-Suffix"`,
+		`token = Abc12345-${suffix}`,
+		`TOKEN=Abc-$SOME_VAR`,
+		`TOKEN=$HOME/.Token1`,
+		`secret: /Users/someone/Projects/App1`,
+		`secret: /private/tmp/com.apple.launchd.Xy12/Listeners`,
+		`token: /api/V1/token`,
+		`private_key: /etc/ssl/Private2/server.key`,
+		`secret: /opt/ReallyLongDirectoryName2/Config`,
+		`secret: ~/Projects/App1`,
+		`secret: ./Projects/App1`,
+		`token=!isValid2`,
+		`token=!this.state.Visible1`,
+		`secret: @scope/Package1`,
+		`secret: @Autowired1`,
+		`secret: #mainContainer1`,
+		`secret: #ff00AA11`,
+		`secret: #!/usr/bin/python3`,
+		`password=%DB_Password1%`,
+		`password=%s-Suffix1`,
+		`password=%Y-%m-%d1A`,
+		`"password": "%{Db_Password1}"`,
+	} {
+		if got := detectAll(t, text); len(got) > 0 {
+			t.Errorf("%s: unexpected %v", text, got)
+		}
+	}
+}
+
+func TestDetectURLPasswords(t *testing.T) {
+	found := map[string]string{
+		`postgres://admin:hunter2hunter@db.internal/app`: "hunter2hunter",
+		`postgres://admin:Hunter2Hunter@db.internal/app`: "Hunter2Hunter",
+		`redis://:supersecretpassword@cache:6379`:        "supersecretpassword",
+		`https://me:correct-horse-battery@host/x`:        "correct-horse-battery",
+		`mysql://root:p%40ssw0rd99@db/app`:               "p%40ssw0rd99",
+		`amqp://bob:12345678@rabbit`:                     "12345678",
+	}
+	for text, want := range found {
+		if got := detectAll(t, text); got[want] != "url_password" {
+			t.Errorf("%s: got %v, want %q", text, got, want)
+		}
+	}
+	// Each of these would otherwise be redacted everywhere it appears
+	for _, text := range []string{
+		`postgres://postgres:postgres@localhost/app`,
+		`postgres://app:postgres@localhost/app`,
+		`mysql://appuser1:appuser1@db`,
+		`postgres://user:password@localhost/app`,
+		`postgres://user:Password@localhost/app`,
+		`postgres://app:development@localhost/app`,
+		`postgres://user:DB_PASSWORD@localhost/app`,
+		`mysql://root:MYSQL_ROOT_PASSWORD@db/app`,
+		`postgres://user:db-password-here@db`,
+		`postgres://user:$PASSWORD@db`,
+		`postgres://user:${DB_PASS}@db`,
+		`postgres://user:{password}@db`,
+		`postgres://user:[password]@db`,
+		`postgres://user:<password>@db`,
+		`postgres://user:your_password@db`,
+		`postgres://user:%s%s%s%s@db`,
+	} {
+		if got := detectAll(t, text); len(got) > 0 {
+			t.Errorf("%s: unexpected %v", text, got)
+		}
+	}
+}
+
+func TestEnvValue(t *testing.T) {
+	cases := map[string]string{
+		`abc123XYZ789`:         "abc123XYZ789",
+		`abc123XYZ789 # prod`:  "abc123XYZ789",
+		"abc123XYZ789\t# prod": "abc123XYZ789",
+		`abc#123XYZ789`:        "abc#123XYZ789",
+		`"Abc123XYZ" # c`:      "Abc123XYZ",
+		`'Abc123XYZ' # c`:      "Abc123XYZ",
+		`"Abc 123 # XYZ"`:      "Abc 123 # XYZ",
+		`"Abc 123 # XYZ" # c`:  "Abc 123 # XYZ",
+		`"Abc\"123" # c`:       `Abc\"123`,
+		`'Abc\' # c`:           `Abc\`,
+		`Abc123XYZ" # c`:       "Abc123XYZ",
+		`Abc123XYZ"`:           "Abc123XYZ",
+		`# nothing set`:        "",
+		``:                     "",
+		`"Abc123"XYZ`:          `"Abc123"XYZ`,
+	}
+	for in, want := range cases {
+		if got := envValue(in); got != want {
+			t.Errorf("%q: got %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestLoadEnvFileComments(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".env")
+	content := strings.Join([]string{
+		`API_TOKEN=abc123XYZ789 # prod`,
+		`DB_PASSWORD="Abc123XYZ" # c`,
+		`  - "SIGNING_KEY=Qw3rTy6UiOp" # yaml`,
+		`SESSION_SECRET= # not set here`,
+	}, "\n")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	col := newCollector()
+	if err := loadEnvFile(path, col); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, s := range col.secrets(&allowlist{}) {
+		got = append(got, s.value)
+	}
+	slices.Sort(got)
+	want := []string{"Abc123XYZ", "Qw3rTy6UiOp", "abc123XYZ789"}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func detectGitleaks(t *testing.T, text string) map[string]string {
+	t.Helper()
+	d, err := newDetector(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	d.scan(newLineFinder(d.gl), text, func(c candidate) { got[c.value] = c.label })
+	return got
+}
+
+// A transcript holds these files under its own name
+func TestDetectRulesGatedByFileName(t *testing.T) {
+	yaml := "apiVersion: v1\nkind: Secret\nmetadata:\n  name: app\ndata:\n  foo: c3VwZXJzZWNyZXQxMjM=\n"
+	if got := detectGitleaks(t, yaml); got["c3VwZXJzZWNyZXQxMjM="] != "kubernetes_secret_yaml" {
+		t.Errorf("Kubernetes Secret: got %v", got)
+	}
+	nuget := `<add key="ClearTextPassword" value="Qw3rTy6UiOp!" />`
+	if got := detectGitleaks(t, nuget); got["Qw3rTy6UiOp!"] != "nuget_config_password" {
+		t.Errorf("NuGet: got %v", got)
+	}
+	// The name rule finds this first, under its better label
+	tf := `administrator_login_password = "Qw3rTy6UiOp1"`
+	if got := detectGitleaks(t, tf); got["Qw3rTy6UiOp1"] == "" {
+		t.Errorf("Terraform: got %v", got)
+	}
+
+	// Without the file name to go on, these say nothing
+	for _, text := range []string{
+		`password = "postgres"`,
+		`password = "development"`,
+		"kind: Secret\ndata:\n  environment: development\n",
+		"kind: Secret\ndata:\n  foo: {{ .Values.foo }}\n",
+		"kind: ConfigMap\ndata:\n  environment: ZGV2ZWxvcG1lbnQx\n",
+		`<add key="Password" value="%NUGET_PASSWORD%" />`,
+	} {
+		if got := detectGitleaks(t, text); len(got) > 0 {
+			t.Errorf("%q: unexpected %v", text, got)
+		}
+	}
+}

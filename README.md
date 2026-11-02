@@ -121,9 +121,13 @@ There are four sources, from most to least trusted:
    at least 8 characters, a mix of character types, and not a path, date,
    placeholder or piece of code.
 3. Passwords in URLs (`postgres://user:pass@host`) and `Authorization: Bearer`
-   or `Basic` headers.
+   or `Basic` headers. A URL password needs at least 8 characters but no mix of
+   types. Plain words need 12, and one that repeats the user name or scheme, like
+   `postgres://postgres:postgres@db`, doesn't count.
 4. The [gitleaks](https://github.com/gitleaks/gitleaks) rules, which know about
-   200+ token formats (AWS, GitHub, Slack, OpenAI, private keys and more).
+   200+ token formats (AWS, GitHub, Slack, OpenAI, private keys and more). Rules
+   meant for one kind of file, like Kubernetes Secrets in YAML, run on everything,
+   since a transcript holds those files under its own name.
 
 Every value found anywhere gets redacted everywhere. If a password shows up
 once as `DB_PASSWORD=...` and later on its own in a `psql` command, both go.
@@ -154,7 +158,10 @@ printed, are cut into windows around each keyword.
 
 - Detection is best effort. A password that never appears next to a
   secret-looking name is missed unless it's in your secrets file. The same
-  goes for derived values, like a base64-encoded `id:key`.
+  goes for derived values, like a base64-encoded `id:key`, and for a password
+  shaped like a reference, such as `$ecretPass1` or `!password123`.
+- In a Kubernetes Secret, the gitleaks rule only finds the first field under
+  `data:`. The others are found if their names look secret.
 - In a text file, detection reads the text as is. A value only ever written
   there with an escape, like `\u00e4`, is missed unless it's in your secrets
   file or was found elsewhere. Once known, it's redacted in any spelling.
