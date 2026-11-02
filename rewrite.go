@@ -51,6 +51,7 @@ type hit struct {
 	start, end int
 	secret     int
 	joined     []int // other secrets inside this hit
+	cont       bool  // a later part of an occurrence, counted at its first
 }
 
 // shift returns h with its offsets moved back by n.
@@ -63,7 +64,9 @@ func (h hit) shift(n int) hit {
 // countHits adds each hit to counts.
 func countHits(counts map[int]int, hits []hit) {
 	for _, h := range hits {
-		counts[h.secret]++
+		if !h.cont {
+			counts[h.secret]++
+		}
 		for _, s := range h.joined {
 			counts[s]++
 		}
@@ -108,6 +111,12 @@ func mergeHits(hits []hit) []hit {
 		}
 		last := &out[len(out)-1]
 		last.end = max(last.end, h.end)
+		if h.cont && h.secret != last.secret {
+			h.secret = last.secret // nothing to count, so nothing to join
+		}
+		if h.secret == last.secret && !h.cont {
+			last.cont = false
+		}
 		for _, s := range append([]int{h.secret}, h.joined...) {
 			if s != last.secret && !slices.Contains(last.joined, s) {
 				last.joined = append(last.joined, s)
@@ -363,15 +372,20 @@ func (r *replacer) redact(data []byte, kind fileKind) redaction {
 
 // redactLines redacts data line by line, for JSON lines and for a document too
 // broken to treat as one. A hit across lines joins them, so it stays if it starts
-// or ends on valid JSON, and goes around any such lines in between. It is taken
-// out before hits are merged, so that what overlaps it on one line still goes.
+// or ends on valid JSON, and goes around any such lines in between, which then
+// count as left. It is taken out before hits are merged, so that what overlaps it
+// on one line still goes.
 func (r *replacer) redactLines(data []byte, occurrences []hit, res *redaction) {
 	var single []hit
 	leftLines := map[int]bool{}
 	for _, h := range occurrences {
 		if bytes.IndexByte(data[h.start:h.end], '\n') >= 0 && touchesJSONLine(data, h) {
-			if parts := aroundJSONLines(data, h); parts != nil {
+			if parts, jsonLines := aroundJSONLines(data, h); parts != nil {
 				single = append(single, parts...)
+				countHits(res.left, []hit{h})
+				for _, ls := range jsonLines {
+					leftLines[ls] = true
+				}
 				continue
 			}
 			countHits(res.left, []hit{h})
@@ -428,22 +442,26 @@ func touchesJSONLine(data []byte, h hit) bool {
 }
 
 // aroundJSONLines cuts h, which touches a line of valid JSON, into the parts between
-// such lines. It returns nil if h starts or ends on one, as replacing h would then
-// change that line. Measured from h.end like touchesJSONLine.
-func aroundJSONLines(data []byte, h hit) []hit {
-	var parts []hit
+// such lines, and returns where each of those lines starts. The parts are still one
+// occurrence. It returns nil if h starts or ends on such a line, as replacing h would
+// then change that line. Measured from h.end like touchesJSONLine.
+func aroundJSONLines(data []byte, h hit) (parts []hit, jsonLines []int) {
+	add := func(start, end int) {
+		parts = append(parts, hit{start: start, end: end, secret: h.secret, cont: len(parts) > 0})
+	}
 	start := h.start
 	for ls := lineStart(data, h.start); ; {
 		le := lineEnd(data, ls)
 		last := h.end <= le
 		if isStructuredJSON(data[ls:le]) {
 			if ls <= h.start || last {
-				return nil
+				return nil, nil
 			}
 			if start < ls-1 {
-				parts = append(parts, hit{start: start, end: ls - 1, secret: h.secret})
+				add(start, ls-1)
 			}
 			start = le + 1
+			jsonLines = append(jsonLines, ls)
 		}
 		if last {
 			break
@@ -451,9 +469,9 @@ func aroundJSONLines(data []byte, h hit) []hit {
 		ls = le + 1
 	}
 	if start < h.end {
-		parts = append(parts, hit{start: start, end: h.end, secret: h.secret})
+		add(start, h.end)
 	}
-	return parts
+	return parts, jsonLines
 }
 
 // redactUnit redacts a line or document at offset base of the file, and isJSON

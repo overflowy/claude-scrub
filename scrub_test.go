@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"maps"
 	"os"
@@ -1871,5 +1872,187 @@ func TestDetectRulesGatedByFileName(t *testing.T) {
 		if got := detectGitleaks(t, text); len(got) > 0 {
 			t.Errorf("%q: unexpected %v", text, got)
 		}
+	}
+}
+
+// A secret spread over a line of JSON it can't touch is one occurrence, part of
+// which stays
+func TestAroundJSONLinesCountsOnce(t *testing.T) {
+	block := fakeKeyBlock("", "")
+	lines := strings.Split(block, "\n")
+	in := strings.Join(slices.Concat(lines[:2], []string{`{"n":1}`}, lines[2:3], []string{`{"m":2}`}, lines[3:]), "\n") + "\n"
+	value := strings.TrimSuffix(in, "\n")
+	rep := newReplacer([]secret{{value: value, label: "private_key"}})
+	red := rep.redact([]byte(in), kindJSONLines)
+	if n := strings.Count(string(red.out), "[REDACTED:private_key]"); n != 3 {
+		t.Errorf("got %d placeholders in %q, want 3", n, red.out)
+	}
+	if red.counts[0] != 1 || red.left[0] != 1 || red.skipped != 2 {
+		t.Errorf("counts %v, left %v, skipped %d", red.counts, red.left, red.skipped)
+	}
+}
+
+// Another secret overlapping a later part still counts, and the part does not
+func TestAroundJSONLinesOverlap(t *testing.T) {
+	long := "AAAAAAAA\n" + `{"n":1}` + "\nBBBBBBBB"
+	cases := []struct {
+		name, other string
+		counts      map[int]int
+	}{
+		{"another secret", "BBBBBBBBCC", map[int]int{0: 1, 1: 1}},
+		{"same line, same text", "BBBB", map[int]int{0: 1, 1: 1}},
+	}
+	for _, c := range cases {
+		rep := newReplacer([]secret{{value: long, label: "x"}, {value: c.other, label: "y"}})
+		red := rep.redact([]byte(long+"CC\n"), kindJSONLines)
+		if !maps.Equal(red.counts, c.counts) {
+			t.Errorf("%s: counts %v, want %v, out %q", c.name, red.counts, c.counts, red.out)
+		}
+	}
+}
+
+func TestMergeHitsCont(t *testing.T) {
+	cases := []struct {
+		name   string
+		hits   []hit
+		counts map[int]int
+	}{
+		{"part first", []hit{{start: 0, end: 5, secret: 0, cont: true}, {start: 2, end: 8, secret: 1}}, map[int]int{1: 1}},
+		{"part second", []hit{{start: 0, end: 5, secret: 1}, {start: 2, end: 8, secret: 0, cont: true}}, map[int]int{1: 1}},
+		{"same secret, part first", []hit{{start: 0, end: 5, secret: 0, cont: true}, {start: 2, end: 8, secret: 0}}, map[int]int{0: 1}},
+		{"same secret, part second", []hit{{start: 0, end: 5, secret: 0}, {start: 2, end: 8, secret: 0, cont: true}}, map[int]int{0: 1}},
+		{"apart", []hit{{start: 0, end: 5, secret: 0}, {start: 6, end: 8, secret: 0, cont: true}}, map[int]int{0: 1}},
+	}
+	for _, c := range cases {
+		counts := map[int]int{}
+		countHits(counts, mergeHits(c.hits))
+		if !maps.Equal(counts, c.counts) {
+			t.Errorf("%s: got %v, want %v", c.name, counts, c.counts)
+		}
+	}
+}
+
+// captureStderr returns what fn wrote to stderr.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderr := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = stderr }()
+	fn()
+	w.Close()
+	b, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func setStdin(t *testing.T, input string) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.WriteString(input); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	stdin := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() { os.Stdin = stdin; r.Close() })
+}
+
+// The hook prints no report, but a match it left must not pass in silence
+func TestHookReportsLeftMatches(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "projects", "p")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	secrets := filepath.Join(root, "secrets")
+	if err := os.WriteFile(secrets, []byte("label=nabc12345XY\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	transcript := filepath.Join(dir, "s.jsonl")
+	// A match on the n of \n, the only one there is: nothing redacted, one left
+	in := `{"a":"{\"b\":\"x\\nabc12345XY\"}"}` + "\n"
+	if err := os.WriteFile(transcript, []byte(in), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setStdin(t, `{"transcript_path":"`+transcript+`"}`)
+	o := testOptions(root)
+	o.hook, o.noGitleaks, o.secrets = true, true, secrets
+	var err error
+	out := captureStderr(t, func() { err = scrub(context.Background(), o, nil) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Left matches in 1 JSON line") {
+		t.Errorf("stderr %q", out)
+	}
+	if b, _ := os.ReadFile(transcript); string(b) != in {
+		t.Errorf("file changed: %s", b)
+	}
+}
+
+func TestUnreadableFileFailsTheRun(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads everything")
+	}
+	root := t.TempDir()
+	good, _ := writeTranscript(t, root)
+	bad := filepath.Join(filepath.Dir(good), "locked.jsonl")
+	if err := os.WriteFile(bad, []byte("{}\n"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(bad, 0o600) })
+
+	for _, dryRun := range []bool{true, false} {
+		o := testOptions(root)
+		o.noGitleaks, o.dryRun, o.minAge = true, dryRun, 0
+		var err error
+		out := captureStderr(t, func() { err = scrub(context.Background(), o, nil) })
+		if err == nil || !strings.Contains(err.Error(), "could not scan 1 file") {
+			t.Errorf("dry run %v: err %v", dryRun, err)
+		}
+		if !strings.Contains(out, "locked.jsonl") {
+			t.Errorf("dry run %v: stderr %q", dryRun, out)
+		}
+	}
+	// The rest still went
+	if b, _ := os.ReadFile(good); strings.Contains(string(b), fakePassword) {
+		t.Error("the readable file was not redacted")
+	}
+
+	// And with nothing else to find, it still must not look clean
+	empty := t.TempDir()
+	locked := filepath.Join(empty, "locked.jsonl")
+	if err := os.WriteFile(locked, []byte("{}\n"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(locked, 0o600) })
+	o := testOptions(empty)
+	o.noGitleaks, o.quiet = true, false
+	var err error
+	out := captureStderr(t, func() { err = scrub(context.Background(), o, []string{locked}) })
+	if err == nil {
+		t.Error("no error for a run that read nothing")
+	}
+	if strings.Contains(out, "Nothing to redact.\n") {
+		t.Errorf("stderr %q", out)
+	}
+}
+
+// A file that turns unreadable between the two passes
+func TestNoteReadErrors(t *testing.T) {
+	first, second := errors.New("first"), errors.New("second")
+	unreadable := map[string]error{"a": first}
+	noteReadErrors(unreadable, []fileResult{{path: "b", err: second}, {path: "c"}})
+	if len(unreadable) != 2 || unreadable["a"] != first || unreadable["b"] != second {
+		t.Errorf("got %v", unreadable)
 	}
 }

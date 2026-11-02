@@ -110,7 +110,7 @@ func scrub(ctx context.Context, o options, paths []string) error {
 			}
 		})
 	}
-	var unreadable []string
+	unreadable := map[string]error{}
 	var mu sync.Mutex
 	forEach(ctx, disc.targets, o.jobs, func(_ int, t target) {
 		data, kind, _, err := readTarget(t.path)
@@ -120,7 +120,7 @@ func scrub(ctx context.Context, o options, paths []string) error {
 		}
 		if err != nil {
 			mu.Lock()
-			unreadable = append(unreadable, fmt.Sprintf("  %s: %v", displayPath(t.path), err))
+			unreadable[t.path] = err
 			mu.Unlock()
 			return
 		}
@@ -151,36 +151,52 @@ func scrub(ctx context.Context, o options, paths []string) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	noteReadErrors(unreadable, results)
 	sum := summarize(secrets, results)
 	logf("Found %s in %s\n", plural(sum.found, "secret"), time.Since(start).Round(100*time.Millisecond))
 
 	if o.jsonOut {
-		if err := printJSON(os.Stdout, sum, o, len(disc.targets)); err != nil {
+		if err := printJSON(os.Stdout, sum, o, len(disc.targets)-len(unreadable), len(unreadable)); err != nil {
 			return err
 		}
 	} else if !o.quiet {
 		printReport(os.Stderr, sum)
 	}
+	// The hook prints no report, and this is not something to keep quiet about
+	if o.hook && sum.skipped > 0 {
+		fmt.Fprintf(os.Stderr, "claude-scrub: %s\n", leftMessage(sum.skipped))
+	}
+	// The rest still gets redacted, but the run did not cover everything, so it
+	// must not end looking as if it had
+	var readErr error
 	if len(unreadable) > 0 {
-		sort.Strings(unreadable)
-		fmt.Fprintf(os.Stderr, "Could not read %s:\n%s\n", plural(len(unreadable), "file"), strings.Join(unreadable, "\n"))
+		var lines []string
+		for path, err := range unreadable {
+			lines = append(lines, fmt.Sprintf("  %s: %v", displayPath(path), err))
+		}
+		sort.Strings(lines)
+		fmt.Fprintf(os.Stderr, "Could not read %s:\n%s\n", plural(len(lines), "file"), strings.Join(lines, "\n"))
+		readErr = fmt.Errorf("could not scan %s; any secrets there remain", plural(len(lines), "file"))
 	}
 
 	if sum.occurrences == 0 {
-		if sum.found > 0 {
+		switch {
+		case sum.found > 0:
 			logf("None of these could be redacted. Nothing changed.\n")
-		} else {
+		case readErr != nil:
+			logf("Nothing to redact in the files that could be read.\n")
+		default:
 			logf("Nothing to redact.\n")
 		}
-		return nil
+		return readErr
 	}
 	if !write {
 		logf("\nWould redact %s in %s. Run without --dry-run to apply.\n", plural(sum.occurrences, "occurrence"), plural(len(sum.files), "file"))
-		return nil
+		return readErr
 	}
 	if !o.force && !confirm(fmt.Sprintf("Redact %s in %s? This cannot be undone. [y/N] ", plural(sum.occurrences, "occurrence"), plural(len(sum.files), "file"))) {
 		logf("Nothing changed.\n")
-		return nil
+		return readErr
 	}
 
 	var todo []target
@@ -209,9 +225,18 @@ func scrub(ctx context.Context, o options, paths []string) error {
 	logf("Redacted %s in %s.\n", plural(occurrences, "occurrence"), plural(done, "file"))
 	if len(failed) > 0 {
 		sort.Strings(failed)
-		return fmt.Errorf("could not redact %s:\n%s", plural(len(failed), "file"), strings.Join(failed, "\n"))
+		return errors.Join(fmt.Errorf("could not redact %s:\n%s", plural(len(failed), "file"), strings.Join(failed, "\n")), readErr)
 	}
-	return nil
+	return readErr
+}
+
+// noteReadErrors adds the files a pass over results could not read.
+func noteReadErrors(unreadable map[string]error, results []fileResult) {
+	for _, r := range results {
+		if r.err != nil {
+			unreadable[r.path] = r.err
+		}
+	}
 }
 
 // hookPaths reads the SessionEnd hook input and returns the session's
@@ -387,11 +412,15 @@ func printReport(w io.Writer, s summary) {
 		fmt.Fprintf(w, "%-*s  %6d  %11d  %5d\n", width, l.label, l.values, l.occurrences, len(l.files))
 	}
 	if s.skipped > 0 {
-		fmt.Fprintf(w, "\nLeft matches in %s: redacting them would have broken the JSON.\n", plural(s.skipped, "JSON line"))
+		fmt.Fprintf(w, "\n%s\n", leftMessage(s.skipped))
 	}
 }
 
-func printJSON(w io.Writer, s summary, o options, scanned int) error {
+func leftMessage(lines int) string {
+	return fmt.Sprintf("Left matches in %s: redacting them would have broken the JSON.", plural(lines, "JSON line"))
+}
+
+func printJSON(w io.Writer, s summary, o options, scanned, unreadable int) error {
 	type jsonLabel struct {
 		Label       string `json:"label"`
 		Values      int    `json:"values"`
@@ -405,13 +434,14 @@ func printJSON(w io.Writer, s summary, o options, scanned int) error {
 		Skipped     int            `json:"skipped_lines,omitempty"`
 	}
 	out := struct {
-		DryRun       bool        `json:"dry_run"`
-		FilesScanned int         `json:"files_scanned"`
-		Occurrences  int         `json:"occurrences"`
-		SkippedLines int         `json:"skipped_lines"`
-		Labels       []jsonLabel `json:"labels"`
-		Files        []jsonFile  `json:"files"`
-	}{DryRun: o.dryRun, FilesScanned: scanned, Occurrences: s.occurrences, SkippedLines: s.skipped}
+		DryRun          bool        `json:"dry_run"`
+		FilesScanned    int         `json:"files_scanned"`
+		FilesUnreadable int         `json:"files_unreadable"`
+		Occurrences     int         `json:"occurrences"`
+		SkippedLines    int         `json:"skipped_lines"`
+		Labels          []jsonLabel `json:"labels"`
+		Files           []jsonFile  `json:"files"`
+	}{DryRun: o.dryRun, FilesScanned: scanned, FilesUnreadable: unreadable, Occurrences: s.occurrences, SkippedLines: s.skipped}
 	for _, l := range s.labels {
 		out.Labels = append(out.Labels, jsonLabel{Label: l.label, Values: l.values, Occurrences: l.occurrences, Files: len(l.files)})
 	}

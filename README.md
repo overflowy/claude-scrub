@@ -79,6 +79,9 @@ claude-scrub
 Without a terminal to confirm on, it refuses to write unless you pass
 `--force`.
 
+If a file can't be read, it still handles the rest, then names that file and
+exits with status 1, so a script can't mistake the run for a complete one.
+
 It skips files modified in the last 10 minutes, so it won't rewrite a session
 that's still running. Change that with `--min-age`. Paths given as arguments
 are scanned whatever their age.
@@ -99,8 +102,8 @@ scrubbed when it ends. Use the path you installed the binary to:
 ```
 
 The hook redacts that session's transcript, its subagent and tool result
-files, and `history.jsonl`. It prints nothing unless it redacted something
-or failed.
+files, and `history.jsonl`. It prints nothing unless it redacted something,
+left a match in place, or failed.
 
 ### Your own secrets and false positives
 
@@ -140,7 +143,8 @@ recognizes other spellings of a value, like `\u00e4` for `ä` or `\/` for `/`,
 in text files too. It only cuts where the cut can't break an escape sequence.
 A match that would make valid JSON invalid, at any level, stays in the file
 and is reported. One that runs across whole lines of valid JSON goes around
-them. A line cut short by a crash only affects itself.
+them, and those lines are reported too. A line cut short by a crash only affects
+itself.
 
 Every other byte stays the same. Each file is written to a temporary file and
 renamed into place, keeping its mode and modification time. If a running
