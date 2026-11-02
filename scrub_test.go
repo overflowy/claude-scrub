@@ -2056,3 +2056,180 @@ func TestNoteReadErrors(t *testing.T) {
 		t.Errorf("got %v", unreadable)
 	}
 }
+
+func TestDiscoverPathsOnce(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s.jsonl")
+	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	d, err := discoverPaths([]string{dir, path, path, "s.jsonl", "./s.jsonl", "."}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.targets) != 1 {
+		t.Errorf("targets %v", d.targets)
+	}
+}
+
+// Nothing dedupes here, so go test -race would catch two workers sharing a slot
+func TestRedactAllKeepsEveryResult(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.txt")
+	if err := os.WriteFile(path, []byte(fakePassword), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rep := newReplacer([]secret{{value: fakePassword, label: "password"}})
+	for _, r := range redactAll(context.Background(), rep, []target{{path: path}, {path: path}, {path: path}}, 3, false) {
+		if r.path != path || r.counts[0] != 1 {
+			t.Errorf("result %+v", r)
+		}
+	}
+}
+
+func TestHookTranscriptWithoutSuffix(t *testing.T) {
+	root := t.TempDir()
+	transcript := filepath.Join(root, "transcript")
+	if err := os.WriteFile(transcript, []byte(`{"a":"DB_PASSWORD=`+fakePassword+`"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setStdin(t, `{"transcript_path":"`+transcript+`"}`)
+	o := testOptions(root)
+	o.hook, o.noGitleaks = true, true
+	var err error
+	out := captureStderr(t, func() { err = scrub(context.Background(), o, nil) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "1 occurrence in 1 file") {
+		t.Errorf("stderr %q", out)
+	}
+}
+
+// replacedFile replaces path the way writeAtomic does, up to
+// and including the rename, and returns the old file still open.
+func replacedFile(t *testing.T, path string, data []byte) *os.File {
+	t.Helper()
+	old, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { old.Close() })
+	tmp := path + ".new"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatal(err)
+	}
+	return old
+}
+
+// A line that reached the old file after the check is copied to the new one
+func TestCopyAppended(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "h.jsonl")
+	before := `{"a":"` + fakePassword + `"}` + "\n"
+	if err := os.WriteFile(path, []byte(before), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := replacedFile(t, path, []byte(`{"a":"x"}`+"\n"))
+	if _, err := old.WriteAt([]byte(`{"b":1}`+"\n"), int64(len(before))); err != nil {
+		t.Fatal(err)
+	}
+	n, err := copyAppended(old, path, int64(len(before)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(path)
+	want := `{"a":"x"}` + "\n" + `{"b":1}` + "\n"
+	if string(b) != want || n != 8 {
+		t.Errorf("got %q (%d copied), want %q", b, n, want)
+	}
+}
+
+// One that arrives just after the rename, from a writer already in flight
+func TestCopyAppendedLateWriter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "h.jsonl")
+	if err := os.WriteFile(path, []byte("old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := replacedFile(t, path, []byte("new\n"))
+	go func() {
+		time.Sleep(appendGrace / 4)
+		old.WriteAt([]byte("late\n"), 4)
+	}()
+	if _, err := copyAppended(old, path, 4); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(path); string(b) != "new\nlate\n" {
+		t.Errorf("got %q", b)
+	}
+}
+
+func TestCopyAppendedNothing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "h.jsonl")
+	if err := os.WriteFile(path, []byte("old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := replacedFile(t, path, []byte("new\n"))
+	if n, err := copyAppended(old, path, 4); n != 0 || err != nil {
+		t.Errorf("copied %d, err %v", n, err)
+	}
+	if b, _ := os.ReadFile(path); string(b) != "new\n" {
+		t.Errorf("got %q", b)
+	}
+}
+
+func TestWriteAtomicNoticesReplacedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s.jsonl")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same size and time, but another file: another scrub got there first
+	other := filepath.Join(dir, "other")
+	if err := os.WriteFile(other, []byte("y"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(other, time.Time{}, info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(other, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAtomic(path, []byte("z"), info); !errors.Is(err, errChanged) {
+		t.Errorf("got %v, want errChanged", err)
+	}
+	if b, _ := os.ReadFile(path); string(b) != "y" {
+		t.Errorf("file overwritten: %q", b)
+	}
+}
+
+func TestWriteAtomicKeepsModTime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	if err := os.WriteFile(path, []byte("x"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAtomic(path, []byte("y"), info); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(old) || after.Mode().Perm() != 0o640 {
+		t.Errorf("mtime %v, mode %v", after.ModTime(), after.Mode().Perm())
+	}
+}

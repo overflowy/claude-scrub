@@ -263,12 +263,8 @@ func hookPaths(r io.Reader, root string) ([]string, error) {
 
 func redactAll(ctx context.Context, rep *replacer, targets []target, jobs int, write bool) []fileResult {
 	results := make([]fileResult, len(targets))
-	idx := map[string]int{}
-	for i, t := range targets {
-		idx[t.path] = i
-	}
-	forEach(ctx, targets, jobs, func(_ int, t target) {
-		results[idx[t.path]] = redactFile(rep, t.path, write)
+	forEach(ctx, targets, jobs, func(i int, t target) {
+		results[i] = redactFile(rep, t.path, write)
 	})
 	return results
 }
@@ -302,21 +298,22 @@ func redactFile(rep *replacer, path string, write bool) fileResult {
 	return res
 }
 
-func forEach(ctx context.Context, targets []target, jobs int, fn func(worker int, t target)) {
-	ch := make(chan target)
+// forEach calls fn with each target and its index, on jobs goroutines.
+func forEach(ctx context.Context, targets []target, jobs int, fn func(i int, t target)) {
+	ch := make(chan int)
 	var wg sync.WaitGroup
-	for w := range jobs {
+	for range jobs {
 		wg.Go(func() {
-			for t := range ch {
-				fn(w, t)
+			for i := range ch {
+				fn(i, targets[i])
 			}
 		})
 	}
-	for _, t := range targets {
+	for i := range targets {
 		if ctx.Err() != nil {
 			break
 		}
-		ch <- t
+		ch <- i
 	}
 	close(ch)
 	wg.Wait()

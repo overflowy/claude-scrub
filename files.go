@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -64,12 +65,21 @@ func discoverHistory(root string, minAge time.Duration, now time.Time) (discover
 }
 
 // discoverPaths lists the given files, and every file under the given
-// directories, whatever their age. A missing path is an error if required.
+// directories, whatever their age, each once however often it was named. A missing
+// path is an error if required.
 func discoverPaths(paths []string, required bool) (discovery, error) {
 	var d discovery
+	seen := map[string]bool{}
 	for _, p := range paths {
 		if err := walkFiles(p, required, func(t target, _ fs.FileInfo) {
-			d.targets = append(d.targets, t)
+			key := t.path
+			if abs, err := filepath.Abs(t.path); err == nil {
+				key = abs
+			}
+			if !seen[key] {
+				seen[key] = true
+				d.targets = append(d.targets, t)
+			}
 		}); err != nil {
 			return d, err
 		}
@@ -209,9 +219,13 @@ func keyBlockEnd(line []byte, base, blockEnd int) int {
 
 var errChanged = errors.New("file changed while it was being redacted")
 
-// writeAtomic replaces path with data, keeping its mode and modification time.
-// It gives up with errChanged if the file no longer matches orig, so lines a
-// running session appended in the meantime are never lost.
+// How long a writer that opened a file just before it was replaced gets to finish
+const appendGrace = 10 * time.Millisecond
+
+// writeAtomic replaces path with data, keeping its mode and modification time. It
+// gives up with errChanged if the file no longer matches orig, so a running session's
+// new lines are redacted on the retry. Lines appended after that check land in the
+// replaced file, and are copied over unredacted, for the next run to find.
 func writeAtomic(path string, data []byte, orig fs.FileInfo) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), tempPrefix+"*")
 	if err != nil {
@@ -233,16 +247,72 @@ func writeAtomic(path string, data []byte, orig fs.FileInfo) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	cur, err := os.Stat(path)
+	old, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	if cur.Size() != orig.Size() || !cur.ModTime().Equal(orig.ModTime()) {
+	defer old.Close()
+	cur, err := old.Stat()
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(cur, orig) || cur.Size() != orig.Size() || !cur.ModTime().Equal(orig.ModTime()) {
 		return errChanged
+	}
+	// Windows refuses to replace an open file, so there the check above is all
+	// there is
+	if runtime.GOOS == "windows" {
+		old.Close()
 	}
 	if err := os.Rename(tmp.Name(), path); err != nil {
 		return fmt.Errorf("replace %s: %w", path, err)
 	}
+	if runtime.GOOS != "windows" {
+		copied, err := copyAppended(old, path, orig.Size())
+		if err != nil {
+			return fmt.Errorf("keep lines appended to %s: %w", path, err)
+		}
+		// The file did change, so its modification time should say so
+		if copied > 0 {
+			return nil
+		}
+	}
 	// Session pickers sort by modification time
 	return os.Chtimes(path, time.Time{}, orig.ModTime())
+}
+
+// copyAppended appends to path what was written to old, the file it replaced, past
+// size. It returns how much that was.
+func copyAppended(old *os.File, path string, size int64) (int64, error) {
+	var copied int64
+	for i := range 2 {
+		if i > 0 {
+			time.Sleep(appendGrace)
+		}
+		info, err := old.Stat()
+		if err != nil {
+			return copied, err
+		}
+		from := size + copied
+		if info.Size() <= from {
+			continue
+		}
+		tail := make([]byte, info.Size()-from)
+		if _, err := old.ReadAt(tail, from); err != nil {
+			return copied, err
+		}
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			return copied, err
+		}
+		_, err = f.Write(tail)
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return copied, err
+		}
+		copied += int64(len(tail))
+	}
+	return copied, nil
 }

@@ -149,7 +149,8 @@ itself.
 Every other byte stays the same. Each file is written to a temporary file and
 renamed into place, keeping its mode and modification time. If a running
 session appends to a file while it's being rewritten, claude-scrub notices
-and tries again.
+and tries again. Lines that arrive in the moment before the rename are copied
+to the new file as they are, and the next run redacts them.
 
 ## Speed
 
@@ -166,6 +167,10 @@ printed, are cut into windows around each keyword.
   shaped like a reference, such as `$ecretPass1` or `!password123`.
 - In a Kubernetes Secret, the gitleaks rule only finds the first field under
   `data:`. The others are found if their names look secret.
+- A program that keeps a history file open while it's replaced goes on writing
+  to the old copy, and those lines are lost. A program that opens the file for
+  each write, or appends only a moment before the replacement, loses nothing. On
+  Windows, lines arriving in that last moment aren't recovered.
 - In a text file, detection reads the text as is. A value only ever written
   there with an escape, like `\u00e4`, is missed unless it's in your secrets
   file or was found elsewhere. Once known, it's redacted in any spelling.
