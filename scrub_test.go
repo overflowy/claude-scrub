@@ -2371,3 +2371,28 @@ func TestScrubLabelledKeysInTranscript(t *testing.T) {
 		t.Errorf("got %s", got)
 	}
 }
+
+// Lines widened into each other must not become one block the size of the file,
+// and what spans lines still has to match wherever the blocks are cut
+func TestWidenedLinesStayBounded(t *testing.T) {
+	const consumer = "dKpQmBzXtRvNwLsGhJyCfTqZ"
+	var sb strings.Builder
+	for i := range 60000 {
+		fmt.Fprintf(&sb, "value %d of the api key\n", i)
+		if i%10000 == 5000 {
+			sb.WriteString("Consumer Key\n\n" + consumer + "\n")
+		}
+	}
+	lines := newLineFinder(nil).lines(sb.String())
+	if len(lines) < 2 {
+		t.Fatalf("got %d spans", len(lines))
+	}
+	for _, l := range lines {
+		if len(l.text) > maxSpan+1024 {
+			t.Errorf("span of %d bytes", len(l.text))
+		}
+	}
+	if got := detectAll(t, sb.String()); got[consumer] != "consumer_key" {
+		t.Errorf("got %v", got)
+	}
+}

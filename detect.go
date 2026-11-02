@@ -210,7 +210,10 @@ func (f *lineFinder) lines(text string) []keywordLine {
 			return true
 		}
 		ls, le := widen(lower, lineStartAt, lineEndAt)
-		if len(spans) > 0 && ls <= spans[len(spans)-1].end {
+		// Widened lines can overlap all the way down a file, and a regex on all of it
+		// is what looking at lines avoids. Past maxSpan they overlap instead of merge,
+		// and each still holds what can match from its own line.
+		if len(spans) > 0 && ls <= spans[len(spans)-1].end && le-spans[len(spans)-1].start <= maxSpan {
 			last := &spans[len(spans)-1]
 			last.end, last.own = max(last.end, le), last.own || own
 			return true
