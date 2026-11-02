@@ -1750,7 +1750,7 @@ func TestDetectURLPasswords(t *testing.T) {
 		`redis://:supersecretpassword@cache:6379`:        "supersecretpassword",
 		`https://me:correct-horse-battery@host/x`:        "correct-horse-battery",
 		`mysql://root:p%40ssw0rd99@db/app`:               "p%40ssw0rd99",
-		`amqp://bob:12345678@rabbit`:                     "12345678",
+		`amqp://bob:Abc12345@rabbit`:                     "Abc12345",
 	}
 	for text, want := range found {
 		if got := detectAll(t, text); got[want] != "url_password" {
@@ -1775,6 +1775,8 @@ func TestDetectURLPasswords(t *testing.T) {
 		`postgres://user:<password>@db`,
 		`postgres://user:your_password@db`,
 		`postgres://user:%s%s%s%s@db`,
+		`amqp://bob:12345678@rabbit`,
+		`redis://:123456789012@cache`,
 	} {
 		if got := detectAll(t, text); len(got) > 0 {
 			t.Errorf("%s: unexpected %v", text, got)

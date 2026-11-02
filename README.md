@@ -125,8 +125,8 @@ There are four sources, from most to least trusted:
    placeholder or piece of code.
 3. Passwords in URLs (`postgres://user:pass@host`) and `Authorization: Bearer`
    or `Basic` headers. A URL password needs at least 8 characters but no mix of
-   types. Plain words need 12, and one that repeats the user name or scheme, like
-   `postgres://postgres:postgres@db`, doesn't count.
+   types. Plain words need 12. A number doesn't count, and neither does one that repeats
+   the user name or scheme, like `postgres://postgres:postgres@db`.
 4. The [gitleaks](https://github.com/gitleaks/gitleaks) rules, which know about
    200+ token formats (AWS, GitHub, Slack, OpenAI, private keys and more). Rules
    meant for one kind of file, like Kubernetes Secrets in YAML, run on everything,

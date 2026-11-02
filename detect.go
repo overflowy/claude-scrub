@@ -493,6 +493,10 @@ func plausibleURLPassword(v, scheme, user string) bool {
 	if !plausibleKnownSecret(v) || len(v) > 512 || strings.EqualFold(v, scheme) || strings.EqualFold(v, user) {
 		return false
 	}
+	// A number means too many other things: 12345678 is in every codebase
+	if strings.Trim(v, "0123456789") == "" {
+		return false
+	}
 	if strings.HasPrefix(v, "{") || strings.HasPrefix(v, "[") || looksLikeCode(v) {
 		return false
 	}
