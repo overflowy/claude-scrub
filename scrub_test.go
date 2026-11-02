@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2233,5 +2234,140 @@ func TestWriteAtomicKeepsModTime(t *testing.T) {
 	}
 	if !after.ModTime().Equal(old) || after.Mode().Perm() != 0o640 {
 		t.Errorf("mtime %v, mode %v", after.ModTime(), after.Mode().Perm())
+	}
+}
+
+func TestDetectQuotedValues(t *testing.T) {
+	cases := map[string]string{
+		`"password": "aword,1."`:        "aword,1.",
+		`DB_PASSWORD="Hunter,2;(Pass]"`: "",
+		`DB_PASSWORD="Hunter,2;Pass]"`:  "Hunter,2;Pass]",
+		`password = 'Hunter2,Pass'`:     "Hunter2,Pass",
+		`{\"password\": \"aword,1.\"}`:  "aword,1.",
+		`token: "Abc&Def123"`:           "Abc&Def123",
+	}
+	for text, want := range cases {
+		got := detectAll(t, text)
+		if want == "" {
+			if len(got) > 0 {
+				t.Errorf("%s: unexpected %v", text, got)
+			}
+			continue
+		}
+		if got[want] == "" {
+			t.Errorf("%s: got %v, want %q", text, got, want)
+		}
+	}
+	// A message in quotes, or a pattern, is not a value
+	for _, text := range []string{
+		`password: "Must be at least 8 characters, 1 digit"`,
+		`token: "Invalid token, Try1 again"`,
+		`password: "[A-Za-z0-9]+"`,
+		`secret: "^[a-z]+,Value1$"`,
+		`password: "${DB_PASSWORD},X1"`,
+		`password: "<%= pass1 %>"`,
+	} {
+		if got := detectAll(t, text); len(got) > 0 {
+			t.Errorf("%s: unexpected %v", text, got)
+		}
+	}
+	// With no closing quote it reads as before, up to the comma
+	if got := detectAll(t, `password: "Hunter2Pass,more`); got["Hunter2Pass"] == "" {
+		t.Errorf("unterminated: got %v", got)
+	}
+}
+
+func TestDetectAPIKeyHeader(t *testing.T) {
+	const key = "QWxhZGRpbjpvcGVuIHNlc2FtZQ9a=="
+	if got := detectAll(t, `curl -H "Authorization: ApiKey `+key+`" https://es`); got[key] != "apikey_auth" {
+		t.Errorf("got %v", got)
+	}
+	for _, text := range []string{
+		`use the apikey authenticationmethod here`,
+		`Authorization: ApiKey YOUR_API_KEY_VALUE_HERE`,
+	} {
+		if got := detectAll(t, text); len(got) > 0 {
+			t.Errorf("%s: unexpected %v", text, got)
+		}
+	}
+}
+
+func TestDetectURLSignature(t *testing.T) {
+	const sig = "x7%2BQkL3mNpR9sT1vWb2%2FcD8eFgH4jK6%3D"
+	for _, text := range []string{
+		`https://a.blob.core.windows.net/c/f?se=2026-01-01&sp=r&sv=2022&sr=b&sig=` + sig,
+		`https://a.blob.core.windows.net/c/f?sig=` + sig + `&se=2026`,
+	} {
+		if got := detectAll(t, text); got[sig] != "url_signature" {
+			t.Errorf("%s: got %v", text, got)
+		}
+	}
+	for _, text := range []string{`func sig=compute(x)`, `?sig=short`, `const sig=abcdefghijklmnopqrstuvwxyz`} {
+		if got := detectAll(t, text); len(got) > 0 {
+			t.Errorf("%s: unexpected %v", text, got)
+		}
+	}
+}
+
+func TestDetectEncodedAPIKey(t *testing.T) {
+	encoded := base64.StdEncoding.EncodeToString([]byte("aBcDeF0123456789xyzA:Zk3LmQ1xYtR7vWb2NcD8eF"))
+	for _, text := range []string{
+		`"encoded": "` + encoded + `"`,
+		`{\"id\":\"x\",\n \"encoded\": \"` + encoded + `\"}`,
+		`encoded=` + encoded,
+	} {
+		if got := detectAll(t, text); got[encoded] != "encoded_api_key" {
+			t.Errorf("%s: got %v", text, got)
+		}
+	}
+	// base64 of anything else, in a field of the same name
+	other := base64.StdEncoding.EncodeToString([]byte("just an ordinary sentence here"))
+	if got := detectAll(t, `"encoded": "`+other+`"`); len(got) > 0 {
+		t.Errorf("unexpected %v", got)
+	}
+}
+
+func TestDetectLabelledKeys(t *testing.T) {
+	const (
+		consumer = "aB3xQmKpZtYvWnLrSdFgHjKl"
+		letters  = "dKpQmBzXtRvNwLsGhJyCfTqZ"
+		secret   = "yT7kLm2QpXw9ZrB4vNc6DfG1hJs8KtA3eU5oIaR0"
+		token    = "AAAAAAAAAAAAAAAAAAAAAPq%3DQbT7kLm2QpXw9ZrB"
+	)
+	cases := []struct{ text, value, label string }{
+		{"this is what I got: Consumer Key\n\n" + consumer + "\n\nnext", consumer, "consumer_key"},
+		{"Consumer Key\n\n" + letters + "\n", letters, "consumer_key"},
+		{"Secret Key\n" + secret, secret, "secret_key"},
+		{"Access Token\n\n" + token + "\n", token, "access_token"},
+		{"Bearer Token\n\n" + token + "\n", token, "bearer_token"},
+		{"Access Token Secret: " + secret, secret, "access_token_secret"},
+		{"API Key = " + secret, secret, "api_key"},
+		{`Consumer Key\n\n` + consumer, consumer, "consumer_key"},
+	}
+	for _, c := range cases {
+		if got := detectAll(t, c.text); got[c.value] != c.label {
+			t.Errorf("%q: got %v, want %s", c.text, got, c.label)
+		}
+	}
+	for _, text := range []string{
+		"Access Token\n\nAccessTokenExpiration\n",
+		"The access token\n\nauthenticationmiddleware",
+		"API key documentation_reference_pages",
+		"Secret Key\n\nprocess.env.SECRET_KEY_VALUE1\n",
+		"Consumer Key\n\n\n\n\n\n\n\n" + consumer,
+	} {
+		if got := detectAll(t, text); len(got) > 0 {
+			t.Errorf("%q: unexpected %v", text, got)
+		}
+	}
+}
+
+// Found in a transcript, the way a prompt holds them, and then redacted
+func TestScrubLabelledKeysInTranscript(t *testing.T) {
+	const consumer = "dKpQmBzXtRvNwLsGhJyCfTqZ"
+	line, _ := json.Marshal(map[string]any{"message": map[string]any{"content": "this is what I got: Consumer Key\n\n" + consumer + "\n\nthanks"}})
+	got := scrubFile(t, "s.jsonl", string(line)+"\n")
+	if strings.Contains(got, consumer) || !json.Valid([]byte(strings.TrimSpace(got))) {
+		t.Errorf("got %s", got)
 	}
 }

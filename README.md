@@ -109,7 +109,9 @@ left a match in place, or failed.
 
 Put values that must always go in `~/.config/claude-scrub/secrets`, one
 `label=value` per line. You can also point `--env-file` at a `.env`, shell or
-YAML file and it picks out the secrets in it.
+YAML file and it picks out the secrets in it. A value here has to match exactly,
+so a password typed once with a typo or without its last character needs a line
+of its own.
 
 Put false positives in `~/.config/claude-scrub/allow`, one value per line.
 `label:NAME` skips a whole label.
@@ -122,11 +124,19 @@ There are four sources, from most to least trusted:
 2. Values assigned to secret-looking names, such as `DB_PASSWORD=...`,
    `"apiKey": "..."` or `--password=...`. The value has to look like a secret:
    at least 8 characters, a mix of character types, and not a path, date,
-   placeholder or piece of code.
-3. Passwords in URLs (`postgres://user:pass@host`) and `Authorization: Bearer`
-   or `Basic` headers. A URL password needs at least 8 characters but no mix of
-   types. Plain words need 12. A number doesn't count, and neither does one that repeats
-   the user name or scheme, like `postgres://postgres:postgres@db`.
+   placeholder or piece of code. A value in quotes runs to the closing quote, so
+   it can hold commas, as long as it holds no spaces.
+3. Patterns that say what a value is:
+   - Passwords in URLs (`postgres://user:pass@host`). These need at least 8
+     characters but no mix of types. Plain words need 12. A number doesn't count,
+     and neither does one that repeats the user name or scheme, like
+     `postgres://postgres:postgres@db`.
+   - `Authorization: Bearer`, `Basic` or `ApiKey` headers.
+   - Signatures in signed URLs (`?sig=...`), such as an Azure SAS.
+   - Keys under a label written in words, like `Consumer Key`, with the value
+     after it or on a following line, as when pasted from a provider's page.
+   - An `encoded` field holding the base64 of `id:key`, which is how Elasticsearch
+     returns API keys.
 4. The [gitleaks](https://github.com/gitleaks/gitleaks) rules, which know about
    200+ token formats (AWS, GitHub, Slack, OpenAI, private keys and more). Rules
    meant for one kind of file, like Kubernetes Secrets in YAML, run on everything,
@@ -165,6 +175,8 @@ printed, are cut into windows around each keyword.
   secret-looking name is missed unless it's in your secrets file. The same
   goes for derived values, like a base64-encoded `id:key`, and for a password
   shaped like a reference, such as `$ecretPass1` or `!password123`.
+- A password held in a variable with no secret-looking name, like `P="..."`, is
+  missed unless it's in your secrets file.
 - In a Kubernetes Secret, the gitleaks rule only finds the first field under
   `data:`. The others are found if their names look secret.
 - A program that keeps a history file open while it's replaced goes on writing

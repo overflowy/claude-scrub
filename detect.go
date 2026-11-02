@@ -49,11 +49,28 @@ var (
 	assignValueRe = regexp.MustCompile(`^\\*["'“”‘’]?[ \t]*(?:=>|:=|=|:)[ \t]*\\*["'“”‘’]?` +
 		"([^\\s\"'“”‘’\\\\`<>(){}\\[\\],;&]{8,})")
 
+	// The same, up to a quote that opens the value: what is inside quotes is one
+	// value, however many commas it holds. Spaces end it, as text in quotes is far
+	// more often a message than a passphrase.
+	assignQuoteRe = regexp.MustCompile(`^\\*["'“”‘’]?[ \t]*(?:=>|:=|=|:)[ \t]*(\\*["'])`)
+
 	// scheme://user:password@host
 	urlCredsRe = regexp.MustCompile(`\b([a-zA-Z][a-zA-Z0-9+.\-]*)://([^\s:/@"'\\]*):([^\s@/"'\\]{6,})@`)
 
 	// Authorization: Bearer xxx / Basic xxx
-	authHeaderRe = regexp.MustCompile(`(?i)\b(bearer|basic)\s+([A-Za-z0-9\-_.~+/]{16,}=*)`)
+	authHeaderRe = regexp.MustCompile(`(?i)\b(bearer|basic|apikey)\s+([A-Za-z0-9\-_.~+/]{16,}=*)`)
+
+	// A name written in words, with its value after it or on a line of its own, as
+	// copied from a provider's page: Consumer Key, then the key
+	labelledRe = regexp.MustCompile(`(?i)\b((?:consumer|api|access|bearer|client|app|secret|auth|private)[ \t]+(?:key|secret|token)(?:[ \t]+secret)?)` +
+		`[ \t]*[:=]?(?:[ \t\r\n]|\\+n){0,6}\\*["'` + "`" + `]?([A-Za-z0-9%+/=_.~\-]{16,})`)
+
+	// The signature in a signed URL, such as an Azure SAS
+	urlSigRe = regexp.MustCompile(`[?&;]sig=([A-Za-z0-9%+/_\-]{20,}={0,2})`)
+
+	// The base64 of id:key that Elasticsearch returns next to an API key
+	encodedKeyRe = regexp.MustCompile(`(?i)\bencoded\\*["']?\s*[:=]\s*\\*["']?([A-Za-z0-9+/_\-]{16,}={0,2})`)
+	idKeyRe      = regexp.MustCompile(`^[\w.\-]{8,}:[\w.\-]{16,}$`)
 
 	// The secret-looking name at the start of a gitleaks generic-api-key
 	// match. Looser than secretWords: any *Auth, and key on its own or after
@@ -96,7 +113,7 @@ var placeholderWords = []string{
 }
 
 // Every match of the rules in scanLine has one of these on its line
-var ownKeywords = append(slices.Clone(secretStems), "://", "bearer", "basic")
+var ownKeywords = append(slices.Clone(secretStems), "://", "bearer", "basic", "sig=", "encoded")
 
 func init() {
 	logging.Logger = zerolog.Nop()
@@ -217,10 +234,10 @@ const (
 	windowMargin = 4 * 1024
 )
 
-// widen grows the line [ls, le) to cover what the gitleaks rules that span
-// lines can match from it: a private key block to its end, a curl command
-// over the next 5 lines (curl-auth-user, curl-auth-header), and a Kubernetes
-// Secret 300 bytes either way (kubernetes-secret-yaml).
+// widen grows the line [ls, le) to cover what the rules that span lines can match
+// from it: a private key block to its end, a curl command over the next 5 lines
+// (curl-auth-user, curl-auth-header), a Kubernetes Secret 300 bytes either way
+// (kubernetes-secret-yaml), and a label ending the line over the next 2 (labelledRe).
 func widen(lower []byte, ls, le int) (int, int) {
 	line := lower[ls:le]
 	if b := bytes.LastIndex(line, []byte("-----begin")); b >= 0 {
@@ -246,6 +263,16 @@ func widen(lower []byte, ls, le int) (int, int) {
 	if bytes.Contains(line, []byte("kind:")) && bytes.Contains(line, []byte("secret")) {
 		ls = lineStart(lower, max(0, ls-300))
 		le = max(le, lineEnd(lower, min(len(lower), le+300)))
+	}
+	if t := bytes.TrimRight(line, " \t\r:"); bytes.HasSuffix(t, []byte("key")) || bytes.HasSuffix(t, []byte("secret")) || bytes.HasSuffix(t, []byte("token")) {
+		end := le
+		for range 2 {
+			if end >= len(lower) {
+				break
+			}
+			end = lineEnd(lower, end+1)
+		}
+		le = max(le, end)
 	}
 	return ls, le
 }
@@ -322,13 +349,44 @@ func scanLine(line keywordLine, add func(candidate)) {
 			}
 		}
 	}
-	if strings.Contains(line.lower, "bearer") || strings.Contains(line.lower, "basic") {
+	if strings.Contains(line.lower, "bearer") || strings.Contains(line.lower, "basic") || strings.Contains(line.lower, "apikey") {
 		for _, m := range authHeaderRe.FindAllStringSubmatch(line.text, -1) {
 			if plausibleSecret(m[2]) {
 				add(candidate{value: m[2], label: strings.ToLower(m[1]) + "_auth", prio: prioPattern})
 			}
 		}
 	}
+	if strings.Contains(line.lower, "key") || strings.Contains(line.lower, "secret") || strings.Contains(line.lower, "token") {
+		for _, m := range labelledRe.FindAllStringSubmatch(line.text, -1) {
+			if plausibleLabelled(m[2]) {
+				add(candidate{value: m[2], label: labelFor(m[1]), prio: prioPattern})
+			}
+		}
+	}
+	if strings.Contains(line.lower, "sig=") {
+		for _, m := range urlSigRe.FindAllStringSubmatch(line.text, -1) {
+			if plausibleKnownSecret(m[1]) {
+				add(candidate{value: m[1], label: "url_signature", prio: prioPattern})
+			}
+		}
+	}
+	if strings.Contains(line.lower, "encoded") {
+		for _, m := range encodedKeyRe.FindAllStringSubmatch(line.text, -1) {
+			if isEncodedKey(m[1]) {
+				add(candidate{value: m[1], label: "encoded_api_key", prio: prioPattern})
+			}
+		}
+	}
+}
+
+// isEncodedKey reports whether v is the base64 of id:key.
+func isEncodedKey(v string) bool {
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.URLEncoding} {
+		if b, err := enc.DecodeString(v); err == nil && idKeyRe.Match(b) {
+			return true
+		}
+	}
+	return false
 }
 
 // scanAssignments finds values assigned to secret-looking names. It starts
@@ -360,6 +418,12 @@ func scanAssignments(line keywordLine, add func(candidate)) {
 		if !secretNameRe.MatchString(name) {
 			return true
 		}
+		if value, ok := quotedValue(text[e:]); ok {
+			if plausibleSecret(value) {
+				add(candidate{value: value, label: labelFor(name), prio: prioName})
+			}
+			return true
+		}
 		m := assignValueRe.FindStringSubmatchIndex(text[e:])
 		if m == nil {
 			return true
@@ -373,6 +437,23 @@ func scanAssignments(line keywordLine, add func(candidate)) {
 		}
 		return true
 	})
+}
+
+// quotedValue returns the value in quotes that rest, what follows a name, assigns to
+// it. Inside quotes a comma or a bracket is part of the value. It reports false if
+// there is no such value: no quote, no closing quote, or a space or an escape before
+// it, which leaves the value to assignValueRe.
+func quotedValue(rest string) (string, bool) {
+	m := assignQuoteRe.FindStringSubmatchIndex(rest)
+	if m == nil {
+		return "", false
+	}
+	quote, body := rest[m[2]:m[3]], rest[m[3]:]
+	end := strings.Index(body[:min(len(body), 513)], quote)
+	if end < 0 || strings.ContainsAny(body[:end], " \t\r\n\\") {
+		return "", false
+	}
+	return body[:end], true
 }
 
 // hasStem reports whether name holds a secret word stem; a cheap check
@@ -470,7 +551,7 @@ func plausibleSecret(v string) bool {
 	if !plausibleKnownSecret(v) || len(v) > 512 {
 		return false
 	}
-	for _, p := range []string{"~/", "./", "{"} {
+	for _, p := range []string{"~/", "./", "{", "[", "^"} {
 		if strings.HasPrefix(v, p) {
 			return false
 		}
@@ -506,14 +587,28 @@ func plausibleURLPassword(v, scheme, user string) bool {
 	return len(v) >= 12 && !(strings.ContainsAny(v, "_-") && hasStem(v))
 }
 
+// plausibleLabelled filters a value under a label written in words. The label says
+// what it is, so an all-letter key passes where a name rule would want a digit, if
+// its case changes too often for an identifier such as AccessTokenExpiry.
+func plausibleLabelled(v string) bool {
+	if plausibleSecret(v) {
+		return true
+	}
+	return plausibleKnownSecret(v) && len(v) >= 20 && len(v) <= 512 && !looksLikeCode(v) && !isDottedIdent(v) &&
+		charClasses(v) >= 2 && classChanges(v)*10 >= 3
+}
+
 // isBase64Noise reports whether v, which starts with a slash, is base64 rather
 // than a path; about 1 base64 key in 64 starts this way. Random text changes
 // between lowercase, uppercase and digits at nearly two thirds of its characters,
 // and a path at far fewer, even one holding a generated name.
 func isBase64Noise(v string) bool {
-	if len(v) < 16 || !base64Re.MatchString(v) {
-		return false
-	}
+	return len(v) >= 16 && base64Re.MatchString(v) && classChanges(v)*5 >= 2
+}
+
+// classChanges returns the share of neighbouring letters and digits in v that
+// differ between lowercase, uppercase and digits.
+func classChanges(v string) float64 {
 	class := func(c byte) byte {
 		switch {
 		case 'a' <= c && c <= 'z':
@@ -536,7 +631,10 @@ func isBase64Noise(v string) bool {
 			changes++
 		}
 	}
-	return changes*5 >= pairs*2
+	if pairs == 0 {
+		return 0
+	}
+	return float64(changes) / float64(pairs)
 }
 
 // looksLikeCode reports whether v is an expression rather than a value: minified
@@ -573,7 +671,7 @@ func isPlaceholder(v string) bool {
 
 // isDottedIdent reports whether v looks like member access in code, such as
 // process.env.TOKEN or settings.SECRET_KEY. Tokens split by dots (JWTs) have
-// long parts full of digits; code rarely does.
+// long parts full of digits and case changes; code rarely does.
 func isDottedIdent(v string) bool {
 	parts := strings.Split(v, ".")
 	if len(parts) < 2 {
@@ -586,7 +684,7 @@ func isDottedIdent(v string) bool {
 		}
 		short = short && len(p) <= 12
 	}
-	return short || !hasDigit(v)
+	return short || !hasDigit(v) || classChanges(v) < 0.3
 }
 
 func charClasses(v string) int {
